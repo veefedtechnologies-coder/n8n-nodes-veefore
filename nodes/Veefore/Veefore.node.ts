@@ -75,7 +75,13 @@ function messageFor(outcome: Outcome, decision: Record<string, unknown>, status?
   const reason = String(decision.reason ?? '')
     .trim()
     .replace(/\.+$/, '');
-  if (outcome === 'allowed') return 'Done. Veefore allowed this and it was carried out.';
+  if (outcome === 'allowed') {
+    const result = decision.result as { client_executed?: unknown } | null | undefined;
+    // "Veefore decides, n8n performs": nothing has happened yet.
+    if (result && typeof result === 'object' && result.client_executed === true)
+      return 'Veefore allowed this. It is not done yet: the node on the Allowed output performs it.';
+    return 'Done. Veefore allowed this and it was carried out.';
+  }
   if (outcome === 'approval')
     return 'Waiting for a person to approve this in Veefore. Nothing has been done yet.';
   if (status === 'DENIED') return `A person denied this in Veefore. Nothing was done.`;
@@ -94,6 +100,12 @@ function summarize(
   return {
     status: outcome,
     message: messageFor(outcome, decision, approvalStatus),
+    performed_by:
+      outcome !== 'allowed'
+        ? null
+        : (decision.result as { client_executed?: unknown } | null)?.client_executed === true
+          ? 'n8n'
+          : 'veefore',
     decision: (decision.decision ?? decision.result ?? null) as string | null,
     outcome: (decision.outcome ?? null) as string | null,
     reason: (decision.reason ?? null) as string | null,
