@@ -1,13 +1,27 @@
 import type {
-  IAuthenticateGeneric,
   ICredentialDataDecryptedObject,
   ICredentialTestRequest,
   ICredentialType,
   IDataObject,
   IHttpRequestHelper,
+  IHttpRequestOptions,
   INodeProperties,
 } from 'n8n-workflow';
-import { VeeforeGateway, type HttpFn } from '../lib/veefore';
+import {
+  VeeforeGateway,
+  identityFingerprint,
+  type HttpFn,
+  type VeeforeCredentials,
+} from '../lib/veefore';
+
+function identityFrom(credentials: ICredentialDataDecryptedObject): VeeforeCredentials {
+  return {
+    gatewayUrl: String(credentials.gatewayUrl ?? ''),
+    agentId: String(credentials.agentId ?? ''),
+    keyId: String(credentials.keyId ?? ''),
+    privateKey: String(credentials.privateKey ?? ''),
+  };
+}
 
 /** Adapts the helper n8n hands to `preAuthentication` to the protocol's HttpFn. */
 function httpFrom(helper: IHttpRequestHelper): HttpFn {
@@ -99,6 +113,13 @@ export class VeeforeApi implements ICredentialType {
       typeOptions: { expirable: true, password: true },
       default: '',
     },
+    {
+      // Fingerprint of the identity fields the session token was issued for.
+      displayName: 'Session Identity',
+      name: 'sessionIdentity',
+      type: 'hidden',
+      default: '',
+    },
   ];
 
   /**
@@ -107,26 +128,34 @@ export class VeeforeApi implements ICredentialType {
    * here, so the credential test proves the identity, not just reachability.
    */
   async preAuthentication(this: IHttpRequestHelper, credentials: ICredentialDataDecryptedObject) {
-    const gateway = new VeeforeGateway(
-      {
-        gatewayUrl: String(credentials.gatewayUrl ?? ''),
-        agentId: String(credentials.agentId ?? ''),
-        keyId: String(credentials.keyId ?? ''),
-        privateKey: String(credentials.privateKey ?? ''),
-      },
-      httpFrom(this),
-    );
-    return { sessionToken: await gateway.token(true) };
+    const identity = identityFrom(credentials);
+    const gateway = new VeeforeGateway(identity, httpFrom(this));
+    return {
+      sessionToken: await gateway.token(true),
+      sessionIdentity: identityFingerprint(identity),
+    };
   }
 
-  authenticate: IAuthenticateGeneric = {
-    type: 'generic',
-    properties: {
-      headers: {
-        Authorization: '=Bearer {{$credentials.sessionToken}}',
-      },
-    },
-  };
+  /**
+   * Presents the stored session token only if it was issued for the identity
+   * currently in the form. After an edit (another agent, key or gateway) the
+   * gateway gets no valid token, answers 401, and n8n runs preAuthentication
+   * again with the new values, so the test checks what was actually entered.
+   */
+  async authenticate(
+    credentials: ICredentialDataDecryptedObject,
+    requestOptions: IHttpRequestOptions,
+  ): Promise<IHttpRequestOptions> {
+    const current = identityFingerprint(identityFrom(credentials));
+    const token =
+      credentials.sessionToken && credentials.sessionIdentity === current
+        ? String(credentials.sessionToken)
+        : 'stale';
+    return {
+      ...requestOptions,
+      headers: { ...(requestOptions.headers ?? {}), Authorization: `Bearer ${token}` },
+    };
+  }
 
   /** An authenticated read: lists the tools this agent may attempt. */
   test: ICredentialTestRequest = {

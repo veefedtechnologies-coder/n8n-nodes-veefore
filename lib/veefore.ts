@@ -116,6 +116,26 @@ export function normalizeGateway(url: string): string {
   return url.trim().replace(/\/+$/, '');
 }
 
+/**
+ * Which identity a session token was issued for. Changing the gateway, agent,
+ * key ID or private key changes it, so a token minted for the old values is
+ * never presented for the new ones.
+ */
+export function identityFingerprint(credentials: Partial<VeeforeCredentials>): string {
+  return createHash('sha256')
+    .update(
+      canonicalJson({
+        gateway: normalizeGateway(String(credentials.gatewayUrl ?? '')),
+        agent: String(credentials.agentId ?? '').trim(),
+        key: String(credentials.keyId ?? '').trim(),
+        privateKey: createHash('sha256')
+          .update(String(credentials.privateKey ?? '').trim())
+          .digest('hex'),
+      }),
+    )
+    .digest('hex');
+}
+
 /** The idempotency key for replaying an approved action (must differ from the original). */
 export function approvalReplayKey(original: string, approvalId: string): string {
   const composed = `${original}:approved:${approvalId}`;
