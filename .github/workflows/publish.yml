@@ -2,15 +2,13 @@
 #
 # n8n accepts nodes for verification only when they are published from GitHub
 # Actions with provenance (since 1 May 2026), and npm generates provenance only
-# from a PUBLIC repository. This file belongs at the root of the public
-# repository that holds this package (for example veefore/n8n-nodes-veefore),
-# not in the private monorepo.
+# from a PUBLIC repository. It runs from
+# github.com/veefedtechnologies-coder/n8n-nodes-veefore; the private Veefore
+# monorepo keeps the source of truth and is copied here for each release.
 #
-# One-time setup (OIDC trusted publishing, no long-lived token):
-#   npmjs.com → package n8n-nodes-veefore → Settings → Publish access →
-#   Trusted Publishers → Add → GitHub Actions:
-#     Repository owner: <org>   Repository name: n8n-nodes-veefore
-#     Workflow name:    publish.yml
+# Publishing uses npm trusted publishing (OIDC): no token is stored. The
+# trusted publisher on npmjs.com names this repository and publish.yml, with
+# no environment.
 #
 # Release: run `npm run release` locally. It lints, builds, bumps the version,
 # tags and pushes; the tag triggers this workflow.
