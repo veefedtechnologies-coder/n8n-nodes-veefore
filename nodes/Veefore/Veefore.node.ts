@@ -4,46 +4,50 @@ import {
   sleep,
   type IDataObject,
   type IExecuteFunctions,
+  type ILoadOptionsFunctions,
   type INodeExecutionData,
+  type INodePropertyOptions,
   type INodeType,
   type INodeTypeDescription,
+  type ResourceMapperField,
+  type ResourceMapperFields,
+  type ResourceMapperValue,
 } from 'n8n-workflow';
 import {
   VeeforeGateway,
   VeeforeGatewayError,
   approvalReplayKey,
+  credentialsFromData,
   itemIdempotencyKey,
+  outcomeOf,
   waitForApproval,
   type HttpFn,
-  type VeeforeCredentials,
+  type Outcome,
 } from '../../lib/veefore';
+import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schema';
 
 /**
  * Veefore for n8n.
  *
- * "Execute action" sends the request to the Veefore gateway, which runs the
- * agent's capabilities, delegation, policy, risk and approval checks, leases
- * the provider credential from its broker and performs the call itself. The
- * workflow never holds the provider secret, and a refused action never
- * happened. "Authorize" asks for a decision without executing.
+ * "Run Tool" sends the request to the Veefore gateway, which checks the
+ * agent's tools, policy, risk and approvals, leases the provider credential
+ * from its broker and performs the call itself. The workflow never holds the
+ * provider secret, and a refused action never happened.
  *
- * Installing this node does not by itself protect anything: an n8n workflow
- * can still contain a direct Gmail or HTTP Request node. Veefore's workflow
- * verifier reports those paths, and the managed profile removes them.
+ * Outcomes are routed, not hidden in options: Allowed, Refused, and Needs
+ * Approval each have their own output. When a person must approve, the node
+ * waits for the decision made in Veefore (for as long as the approval is open)
+ * and then runs the approved action, or routes the item to Needs Approval if
+ * the workflow should carry on instead.
+ *
+ * As a tool for an AI Agent the same node returns one result the model can
+ * read, and fills each tool parameter from the model.
  */
 
-function credentialsFrom(data: IDataObject): VeeforeCredentials {
-  return {
-    gatewayUrl: String(data.gatewayUrl ?? ''),
-    agentId: String(data.agentId ?? ''),
-    keyId: String(data.keyId ?? ''),
-    privateKey: String(data.privateKey ?? ''),
-    runtimeConnectionId: data.runtimeConnectionId ? String(data.runtimeConnectionId) : undefined,
-  };
-}
+type Http = IExecuteFunctions['helpers'] | ILoadOptionsFunctions['helpers'];
 
-/** Execution path: n8n's httpRequest helper, which honours the instance's proxy settings. */
-function httpForExecute(helpers: IExecuteFunctions['helpers']): HttpFn {
+/** n8n's httpRequest helper, which honours the instance's proxy settings. */
+function httpFrom(helpers: Http): HttpFn {
   return async (request) => {
     const response = (await helpers.httpRequest({
       method: request.method,
@@ -59,7 +63,403 @@ function httpForExecute(helpers: IExecuteFunctions['helpers']): HttpFn {
   };
 }
 
-function parseParameters(
+async function gatewayFor(context: IExecuteFunctions | ILoadOptionsFunctions) {
+  const data = (await context.getCredentials('veeforeApi')) as IDataObject;
+  return new VeeforeGateway(credentialsFromData(data), httpFrom(context.helpers));
+}
+
+const OUTPUT_INDEX: Record<Outcome, number> = { allowed: 0, refused: 1, approval: 2 };
+
+/** What an AI agent, or a person reading the output, should take from a decision. */
+function messageFor(outcome: Outcome, decision: Record<string, unknown>, status?: string): string {
+  const reason = String(decision.reason ?? '')
+    .trim()
+    .replace(/\.+$/, '');
+  if (outcome === 'allowed') return 'Done. Veefore allowed this and it was carried out.';
+  if (outcome === 'approval')
+    return 'Waiting for a person to approve this in Veefore. Nothing has been done yet.';
+  if (status === 'DENIED') return `A person denied this in Veefore. Nothing was done.`;
+  if (status === 'EXPIRED') return 'No one approved this in time. Nothing was done.';
+  if (decision.outcome === 'FAILED')
+    return `Veefore allowed this, but the tool did not complete${reason ? `: ${reason}` : ''}. Do not assume it happened.`;
+  return `Veefore refused this${reason ? `: ${reason}` : ''}. Nothing was done.`;
+}
+
+function summarize(
+  outcome: Outcome,
+  decision: Record<string, unknown>,
+  approvalStatus?: string,
+): IDataObject {
+  const approval = (decision.approval ?? null) as IDataObject | null;
+  return {
+    status: outcome,
+    message: messageFor(outcome, decision, approvalStatus),
+    decision: (decision.decision ?? decision.result ?? null) as string | null,
+    outcome: (decision.outcome ?? null) as string | null,
+    reason: (decision.reason ?? null) as string | null,
+    action_id: (decision.action_id ?? null) as string | null,
+    approval_id: (approval?.approval_id as string | undefined) ?? null,
+    approval_status: approvalStatus ?? (approval?.status as string | undefined) ?? null,
+    result: (decision.result && typeof decision.result === 'object'
+      ? decision.result
+      : null) as IDataObject | null,
+    ...(decision.authorization_id
+      ? {
+          authorization_id: decision.authorization_id as string,
+          expires_at: decision.expires_at as string,
+        }
+      : {}),
+  };
+}
+
+export class Veefore implements INodeType {
+  description: INodeTypeDescription = {
+    displayName: 'Veefore',
+    name: 'veefore',
+    icon: { light: 'file:veefore.svg', dark: 'file:veefore.dark.svg' },
+    group: ['transform'],
+    version: 1,
+    subtitle:
+      '={{$parameter["operation"] + ($parameter["tool"] ? ": " + $parameter["tool"] : "")}}',
+    description: 'Run actions through Veefore policy, approvals and credential brokering',
+    defaults: { name: 'Veefore' },
+    inputs: [NodeConnectionTypes.Main],
+    outputs: [NodeConnectionTypes.Main, NodeConnectionTypes.Main, NodeConnectionTypes.Main],
+    outputNames: ['Allowed', 'Refused', 'Needs Approval'],
+    usableAsTool: true,
+    credentials: [{ name: 'veeforeApi', required: true }],
+    properties: [
+      {
+        displayName: 'Operation',
+        name: 'operation',
+        type: 'options',
+        noDataExpression: true,
+        options: [
+          {
+            name: 'Run Tool',
+            value: 'execute',
+            action: 'Run a protected tool',
+            description: 'Veefore decides, asks a person when policy says so, and runs it',
+          },
+          {
+            name: 'Check Only',
+            value: 'authorize',
+            action: 'Check whether a tool call would be allowed',
+            description: 'Get the decision without running anything',
+          },
+          {
+            name: 'List Tools',
+            value: 'listTools',
+            action: 'List the tools this agent may use',
+          },
+          {
+            name: 'Get Approval',
+            value: 'approvalStatus',
+            action: 'Get the status of an approval',
+          },
+        ],
+        default: 'execute',
+      },
+      {
+        displayName: 'Tool Name or ID',
+        name: 'tool',
+        type: 'options',
+        typeOptions: { loadOptionsMethod: 'getTools' },
+        default: '',
+        required: true,
+        description:
+          'A tool this agent may use, as configured in Veefore. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+        displayOptions: { show: { operation: ['execute', 'authorize'] } },
+      },
+      {
+        displayName: 'Send Parameters As',
+        name: 'inputMode',
+        type: 'options',
+        options: [
+          { name: 'Fields', value: 'fields', description: "From the tool's parameter list" },
+          { name: 'JSON', value: 'json' },
+        ],
+        default: 'fields',
+        displayOptions: { show: { operation: ['execute', 'authorize'] } },
+      },
+      {
+        displayName: 'Parameters',
+        name: 'parameters',
+        type: 'resourceMapper',
+        noDataExpression: true,
+        default: { mappingMode: 'defineBelow', value: null },
+        required: true,
+        typeOptions: {
+          loadOptionsDependsOn: ['tool'],
+          resourceMapper: {
+            resourceMapperMethod: 'getToolParameters',
+            mode: 'add',
+            fieldWords: { singular: 'parameter', plural: 'parameters' },
+            addAllFields: true,
+            multiKeyMatch: false,
+            supportAutoMap: false,
+            noFieldsError: 'This tool declares no parameters in Veefore. Use JSON to send some.',
+          },
+        },
+        displayOptions: { show: { operation: ['execute', 'authorize'], inputMode: ['fields'] } },
+      },
+      {
+        displayName: 'Parameters (JSON)',
+        name: 'parametersJson',
+        type: 'json',
+        default: '{}',
+        description: 'Approval and checks are bound to these exact values',
+        displayOptions: { show: { operation: ['execute', 'authorize'], inputMode: ['json'] } },
+      },
+      {
+        displayName: 'When a Person Must Approve',
+        name: 'onApproval',
+        type: 'options',
+        options: [
+          {
+            name: 'Wait for Their Decision',
+            value: 'wait',
+            description:
+              'Pause here until the approval is decided in Veefore, then run it (Allowed) or stop (Refused)',
+          },
+          {
+            name: 'Continue on Needs Approval Output',
+            value: 'route',
+            description: 'Do not wait; the item leaves on the Needs Approval output',
+          },
+        ],
+        default: 'wait',
+        description:
+          'Whether approval is needed is decided by your Veefore policy, not here. This only says what the workflow does meanwhile.',
+        displayOptions: { show: { operation: ['execute'], '@tool': [false] } },
+      },
+      {
+        displayName:
+          'The model fills in each parameter. Veefore decides whether it runs, and waits for a person when your policy asks for approval.',
+        name: 'toolNotice',
+        type: 'notice',
+        default: '',
+        displayOptions: { show: { '@tool': [true] } },
+      },
+      {
+        displayName: 'Approval ID',
+        name: 'approvalId',
+        type: 'string',
+        default: '',
+        required: true,
+        description: 'From the Needs Approval output of an earlier Veefore node',
+        displayOptions: { show: { operation: ['approvalStatus'] } },
+      },
+      {
+        displayName: 'Options',
+        name: 'options',
+        type: 'collection',
+        placeholder: 'Add Option',
+        default: {},
+        displayOptions: { show: { operation: ['execute', 'authorize'] } },
+        options: [
+          {
+            displayName: 'Purpose',
+            name: 'purpose',
+            type: 'string',
+            default: '',
+            description: 'Why the action is being taken. Shown to approvers and recorded.',
+          },
+        ],
+      },
+    ],
+  };
+
+  methods = {
+    loadOptions: {
+      async getTools(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+        const gateway = await gatewayFor(this);
+        const tools = await gateway.tools();
+        return tools.map((tool) => ({
+          name: String(tool.name ?? tool.key),
+          value: String(tool.key),
+          description: String(tool.description || tool.key),
+        }));
+      },
+    },
+    resourceMapping: {
+      async getToolParameters(this: ILoadOptionsFunctions): Promise<ResourceMapperFields> {
+        const toolKey = String(this.getCurrentNodeParameter('tool') ?? '');
+        if (!toolKey) return { fields: [], emptyFieldsNotice: 'Choose a tool first.' };
+        const gateway = await gatewayFor(this);
+        const tool = (await gateway.tools()).find((entry) => entry.key === toolKey);
+        if (!tool) {
+          return {
+            fields: [],
+            emptyFieldsNotice: 'This agent may not use that tool. Check its access in Veefore.',
+          };
+        }
+        const asTool = this.getNode().type.endsWith('Tool');
+        const fields: ResourceMapperField[] = fieldsFromSchema(
+          (tool.parameter_schema ?? {}) as JsonSchema,
+          { fromAi: asTool },
+        );
+        return { fields };
+      },
+    },
+  };
+
+  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+    const items = this.getInputData();
+    const gateway = await gatewayFor(this);
+    const workflow = this.getWorkflow();
+    const node = this.getNode();
+    const asTool = node.type.endsWith('Tool');
+    let instance: string | null = null;
+    try {
+      instance = this.getInstanceBaseUrl();
+    } catch {
+      instance = null;
+    }
+    let instanceId: string | null = null;
+    try {
+      instanceId = this.getInstanceId() || null;
+    } catch {
+      instanceId = null;
+    }
+    const runtime = {
+      connectionId: null,
+      instance,
+      workflowId: workflow.id ? String(workflow.id) : null,
+      executionId: this.getExecutionId() ?? null,
+      step: node.name,
+    };
+
+    const outputs: INodeExecutionData[][] = [[], [], []];
+    const emit = (outcome: Outcome, json: IDataObject, itemIndex: number) => {
+      // An AI agent reads only the first output; it gets every outcome there.
+      outputs[asTool ? 0 : OUTPUT_INDEX[outcome]]!.push({ json, pairedItem: { item: itemIndex } });
+    };
+
+    for (let itemIndex = 0; itemIndex < Math.max(items.length, 1); itemIndex += 1) {
+      const operation = this.getNodeParameter('operation', itemIndex) as string;
+      try {
+        if (operation === 'listTools') {
+          const tools = await gateway.tools();
+          outputs[0]!.push({
+            json: {
+              tools: tools.map(({ key, name, description, capability, risk_level }) => ({
+                key,
+                name,
+                description,
+                capability,
+                risk_level,
+              })) as IDataObject[],
+            },
+            pairedItem: { item: itemIndex },
+          });
+          continue;
+        }
+        if (operation === 'approvalStatus') {
+          const approvalId = (this.getNodeParameter('approvalId', itemIndex) as string).trim();
+          const approval = await gateway.approvalStatus(approvalId);
+          const status = String(approval.status ?? 'PENDING');
+          const outcome: Outcome =
+            status === 'APPROVED' ? 'allowed' : status === 'PENDING' ? 'approval' : 'refused';
+          emit(outcome, approval as IDataObject, itemIndex);
+          continue;
+        }
+
+        const tool = String(this.getNodeParameter('tool', itemIndex) ?? '').trim();
+        if (!tool)
+          throw new NodeOperationError(node, 'Choose the Veefore tool to run.', { itemIndex });
+        const inputMode = this.getNodeParameter('inputMode', itemIndex, 'fields') as string;
+        const parameters =
+          inputMode === 'json'
+            ? parseJsonParameters(
+                this,
+                this.getNodeParameter('parametersJson', itemIndex, '{}'),
+                itemIndex,
+              )
+            : parametersFromMapper(
+                this.getNodeParameter('parameters', itemIndex, null) as ResourceMapperValue | null,
+              );
+        const options = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
+        const idempotencyKey = itemIdempotencyKey({
+          instanceId: instanceId ?? instance,
+          workflowId: runtime.workflowId,
+          executionId: runtime.executionId,
+          node: node.name,
+          itemIndex,
+          tool,
+          parameters,
+        });
+        const base = {
+          tool,
+          parameters,
+          purpose: (options.purpose as string | undefined) || undefined,
+          idempotencyKey,
+          runtime,
+        };
+
+        if (operation === 'authorize') {
+          const decision = await gateway.authorize(base);
+          const outcome = outcomeOf(decision);
+          emit(
+            outcome,
+            { ...summarize(outcome, decision), message: checkMessage(outcome, decision) },
+            itemIndex,
+          );
+          continue;
+        }
+
+        let decision = await gateway.execute(base);
+        let outcome = outcomeOf(decision);
+        let approvalStatus: string | undefined;
+        const approval = decision.approval as { approval_id?: string } | null | undefined;
+        const onApproval = asTool
+          ? 'wait'
+          : (this.getNodeParameter('onApproval', itemIndex, 'wait') as string);
+        if (outcome === 'approval' && approval?.approval_id && onApproval === 'wait') {
+          approvalStatus = await waitForApproval(gateway, approval.approval_id, sleep);
+          if (approvalStatus === 'APPROVED') {
+            decision = await gateway.execute({
+              ...base,
+              approvalId: approval.approval_id,
+              idempotencyKey: approvalReplayKey(idempotencyKey, approval.approval_id),
+            });
+            outcome = outcomeOf(decision);
+          } else {
+            outcome = 'refused';
+          }
+        }
+        emit(outcome, summarize(outcome, decision, approvalStatus), itemIndex);
+      } catch (error) {
+        if (this.continueOnFail()) {
+          outputs[asTool ? 0 : 1]!.push({
+            json: { status: 'error', message: (error as Error).message },
+            pairedItem: { item: itemIndex },
+          });
+          continue;
+        }
+        if (error instanceof VeeforeGatewayError) {
+          throw new NodeOperationError(node, error.message, {
+            itemIndex,
+            description: error.code ?? undefined,
+          });
+        }
+        throw new NodeOperationError(node, error as Error, { itemIndex });
+      }
+    }
+    return asTool ? [outputs[0]!] : outputs;
+  }
+}
+
+function checkMessage(outcome: Outcome, decision: Record<string, unknown>): string {
+  const reason = String(decision.reason ?? '')
+    .trim()
+    .replace(/\.+$/, '');
+  if (outcome === 'allowed') return 'Veefore would allow this. Nothing was run.';
+  if (outcome === 'approval') return 'This would need a person to approve it. Nothing was run.';
+  return `Veefore would refuse this${reason ? `: ${reason}` : ''}. Nothing was run.`;
+}
+
+function parseJsonParameters(
   node: IExecuteFunctions,
   raw: unknown,
   itemIndex: number,
@@ -76,309 +476,4 @@ function parseParameters(
     }
   }
   throw new NodeOperationError(node.getNode(), 'Parameters must be a JSON object.', { itemIndex });
-}
-
-export class Veefore implements INodeType {
-  description: INodeTypeDescription = {
-    displayName: 'Veefore',
-    name: 'veefore',
-    icon: { light: 'file:veefore.svg', dark: 'file:veefore.dark.svg' },
-    group: ['transform'],
-    version: 1,
-    subtitle: '={{$parameter["operation"] + ": " + $parameter["tool"]}}',
-    description: 'Run a protected action through Veefore policy, approval and credential brokering',
-    defaults: { name: 'Veefore' },
-    inputs: [NodeConnectionTypes.Main],
-    outputs: [NodeConnectionTypes.Main],
-    usableAsTool: true,
-    credentials: [{ name: 'veeforeApi', required: true }],
-    properties: [
-      {
-        displayName: 'Operation',
-        name: 'operation',
-        type: 'options',
-        noDataExpression: true,
-        options: [
-          {
-            name: 'Execute Action',
-            value: 'execute',
-            action: 'Execute a protected action',
-            description: 'Veefore decides, leases the credential and performs the call',
-          },
-          {
-            name: 'Authorize',
-            value: 'authorize',
-            action: 'Ask whether an action would be allowed',
-            description: 'Dry run: nothing executes',
-          },
-          {
-            name: 'Get Approval Status',
-            value: 'approvalStatus',
-            action: 'Get the status of an approval',
-          },
-          {
-            name: 'List Permitted Tools',
-            value: 'listTools',
-            action: 'List the tools this agent may attempt',
-          },
-        ],
-        default: 'execute',
-      },
-      {
-        displayName: 'Tool',
-        name: 'tool',
-        type: 'string',
-        default: '',
-        required: true,
-        placeholder: 'send_email',
-        description: 'Key of a tool registered in Veefore',
-        displayOptions: { show: { operation: ['execute', 'authorize'] } },
-      },
-      {
-        displayName: 'Action',
-        name: 'action',
-        type: 'string',
-        default: '',
-        description: 'Logical action, when the tool has several. Defaults to the tool key.',
-        displayOptions: { show: { operation: ['execute', 'authorize'] } },
-      },
-      {
-        displayName: 'Parameters',
-        name: 'parameters',
-        type: 'json',
-        default: '{}',
-        description:
-          'Arguments for the tool. Approval and authorization are bound to these exact values.',
-        displayOptions: { show: { operation: ['execute', 'authorize'] } },
-      },
-      {
-        displayName: 'Approval ID',
-        name: 'approvalId',
-        type: 'string',
-        default: '',
-        displayOptions: { show: { operation: ['approvalStatus'] } },
-      },
-      {
-        displayName: 'Options',
-        name: 'options',
-        type: 'collection',
-        placeholder: 'Add Option',
-        default: {},
-        displayOptions: { show: { operation: ['execute', 'authorize'] } },
-        options: [
-          {
-            displayName: 'Approval ID to Use',
-            name: 'approvalId',
-            type: 'string',
-            default: '',
-            description:
-              'Run an action a person already approved. The parameters must match exactly.',
-            displayOptions: { show: { '/operation': ['execute'] } },
-          },
-          {
-            displayName: 'Authorization ID',
-            name: 'authorizationId',
-            type: 'string',
-            default: '',
-            description:
-              'From an earlier "Authorize" for the same parameters. Single use, 120 seconds.',
-            displayOptions: { show: { '/operation': ['execute'] } },
-          },
-          {
-            displayName: 'Fail on Refusal',
-            name: 'failOnRefusal',
-            type: 'boolean',
-            default: true,
-            description:
-              'Whether a refused or failed action stops the workflow. Off returns the decision as data.',
-          },
-          {
-            displayName: 'Idempotency Key',
-            name: 'idempotencyKey',
-            type: 'string',
-            default: '',
-            description:
-              'Defaults to instance, execution, step, item and arguments, so a retried step cannot act twice',
-          },
-          {
-            displayName: 'Purpose',
-            name: 'purpose',
-            type: 'string',
-            default: '',
-            description: 'Why the action is being taken. Recorded and available to policy.',
-          },
-          {
-            displayName: 'Wait for Approval (Seconds)',
-            name: 'waitSeconds',
-            type: 'number',
-            typeOptions: { minValue: 0, maxValue: 3600 },
-            default: 0,
-            description:
-              'When a person must approve, wait up to this long and then run the approved action. 0 returns "pending" straight away.',
-            displayOptions: { show: { '/operation': ['execute'] } },
-          },
-        ],
-      },
-    ],
-  };
-
-  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-    const items = this.getInputData();
-    const credentials = credentialsFrom((await this.getCredentials('veeforeApi')) as IDataObject);
-    const gateway = new VeeforeGateway(credentials, httpForExecute(this.helpers));
-    const workflow = this.getWorkflow();
-    const node = this.getNode();
-    let instance: string | null = null;
-    try {
-      instance = this.getInstanceBaseUrl();
-    } catch {
-      instance = null;
-    }
-    let instanceId: string | null = null;
-    try {
-      instanceId = this.getInstanceId() || null;
-    } catch {
-      instanceId = null;
-    }
-    const runtime = {
-      connectionId: credentials.runtimeConnectionId ?? null,
-      instance,
-      workflowId: workflow.id ? String(workflow.id) : null,
-      executionId: this.getExecutionId() ?? null,
-      step: node.name,
-    };
-
-    const out: INodeExecutionData[] = [];
-    for (let itemIndex = 0; itemIndex < Math.max(items.length, 1); itemIndex += 1) {
-      const operation = this.getNodeParameter('operation', itemIndex) as string;
-      try {
-        if (operation === 'listTools') {
-          out.push({
-            json: { tools: (await gateway.tools()) as unknown as IDataObject[] },
-            pairedItem: { item: itemIndex },
-          });
-          continue;
-        }
-        if (operation === 'approvalStatus') {
-          const approvalId = this.getNodeParameter('approvalId', itemIndex) as string;
-          out.push({
-            json: (await gateway.approvalStatus(approvalId)) as IDataObject,
-            pairedItem: { item: itemIndex },
-          });
-          continue;
-        }
-
-        const tool = (this.getNodeParameter('tool', itemIndex) as string).trim();
-        if (!tool)
-          throw new NodeOperationError(node, 'Choose the Veefore tool to call.', { itemIndex });
-        const action =
-          (this.getNodeParameter('action', itemIndex, '') as string).trim() || undefined;
-        const parameters = parseParameters(
-          this,
-          this.getNodeParameter('parameters', itemIndex, '{}'),
-          itemIndex,
-        );
-        const options = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
-        const failOnRefusal = options.failOnRefusal !== false;
-        const idempotencyKey = itemIdempotencyKey(
-          {
-            instanceId: instanceId ?? instance,
-            workflowId: runtime.workflowId,
-            executionId: runtime.executionId,
-            node: node.name,
-            itemIndex,
-            tool,
-            action,
-            parameters,
-          },
-          options.idempotencyKey as string | undefined,
-        );
-        const base = {
-          tool,
-          action,
-          parameters,
-          purpose: (options.purpose as string | undefined) || undefined,
-          idempotencyKey,
-          runtime,
-        };
-
-        if (operation === 'authorize') {
-          const decision = await gateway.authorize(base);
-          if (failOnRefusal && decision.result !== 'ALLOW') {
-            throw new NodeOperationError(
-              node,
-              `Veefore did not authorize this: ${String(decision.reason ?? decision.result)}`,
-              { itemIndex },
-            );
-          }
-          out.push({ json: decision as IDataObject, pairedItem: { item: itemIndex } });
-          continue;
-        }
-
-        const presetApproval = (options.approvalId as string | undefined)?.trim() || undefined;
-        let decision = await gateway.execute({
-          ...base,
-          approvalId: presetApproval,
-          idempotencyKey: presetApproval
-            ? approvalReplayKey(idempotencyKey, presetApproval)
-            : idempotencyKey,
-          authorizationId: (options.authorizationId as string | undefined)?.trim() || undefined,
-        });
-
-        const waitSeconds = Number(options.waitSeconds ?? 0);
-        const approval = decision.approval as { approval_id?: string } | null | undefined;
-        if (decision.outcome === 'APPROVAL_REQUIRED' && approval?.approval_id && waitSeconds > 0) {
-          const status = await waitForApproval(gateway, approval.approval_id, waitSeconds, sleep);
-          if (status === 'APPROVED') {
-            decision = await gateway.execute({
-              ...base,
-              approvalId: approval.approval_id,
-              idempotencyKey: approvalReplayKey(idempotencyKey, approval.approval_id),
-            });
-          } else {
-            decision = { ...decision, approval_status: status };
-          }
-        }
-
-        const allowed = decision.allowed === true;
-        if (!allowed && failOnRefusal) {
-          const pending = decision.outcome === 'APPROVAL_REQUIRED';
-          throw new NodeOperationError(
-            node,
-            pending
-              ? `Waiting for a person to approve (approval ${approval?.approval_id ?? 'unknown'}). Nothing has been done yet.`
-              : decision.outcome === 'FAILED'
-                ? `Veefore allowed this, but the tool did not complete: ${String(decision.reason)}. Do not assume it happened.`
-                : `Veefore blocked this: ${String(decision.reason)}`,
-            { itemIndex, description: `Action ${String(decision.action_id ?? '')}` },
-          );
-        }
-        out.push({
-          json: {
-            allowed,
-            decision: decision.decision,
-            outcome: decision.outcome,
-            reason: decision.reason,
-            action_id: decision.action_id,
-            approval: (decision.approval ?? null) as IDataObject | null,
-            result: (decision.result ?? null) as IDataObject | null,
-          } as IDataObject,
-          pairedItem: { item: itemIndex },
-        });
-      } catch (error) {
-        if (this.continueOnFail()) {
-          out.push({ json: { error: (error as Error).message }, pairedItem: { item: itemIndex } });
-          continue;
-        }
-        if (error instanceof VeeforeGatewayError) {
-          throw new NodeOperationError(node, error.message, {
-            itemIndex,
-            description: error.code ?? undefined,
-          });
-        }
-        throw new NodeOperationError(node, error as Error, { itemIndex });
-      }
-    }
-    return [out];
-  }
 }

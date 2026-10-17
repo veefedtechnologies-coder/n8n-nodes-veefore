@@ -8,20 +8,12 @@ import type {
   INodeProperties,
 } from 'n8n-workflow';
 import {
+  DEFAULT_GATEWAY_URL,
   VeeforeGateway,
+  credentialsFromData as identityFrom,
   identityFingerprint,
   type HttpFn,
-  type VeeforeCredentials,
 } from '../lib/veefore';
-
-function identityFrom(credentials: ICredentialDataDecryptedObject): VeeforeCredentials {
-  return {
-    gatewayUrl: String(credentials.gatewayUrl ?? ''),
-    agentId: String(credentials.agentId ?? ''),
-    keyId: String(credentials.keyId ?? ''),
-    privateKey: String(credentials.privateKey ?? ''),
-  };
-}
 
 /** Adapts the helper n8n hands to `preAuthentication` to the protocol's HttpFn. */
 function httpFrom(helper: IHttpRequestHelper): HttpFn {
@@ -41,19 +33,19 @@ function httpFrom(helper: IHttpRequestHelper): HttpFn {
 }
 
 /**
- * The agent's identity, held by n8n's encrypted credential store.
+ * The agent's connection, held by n8n's encrypted credential store.
  *
- * This is an *agent* credential: an Ed25519 private key that lets the
- * workflow prove it is one specific Veefore agent. It grants no authority of
- * its own — every request it signs still goes through the agent's
- * capabilities, policy, risk and approvals at the Veefore gateway — and it is
- * never a Veefore administrator credential. Provider secrets (Gmail, Stripe,
- * a database) stay in the Veefore credential broker and never reach n8n.
+ * Created in the Veefore console under Integrations → n8n, which shows the Key
+ * ID and the connection secret once. The secret is the agent key's Ed25519
+ * private half: it signs a two-minute identity assertion and grants nothing
+ * else. Every action still goes through the agent's tools, policy, risk and
+ * approvals at the gateway. Provider secrets (Gmail, Stripe, a database) stay
+ * in the Veefore credential broker and never reach n8n.
  */
 export class VeeforeApi implements ICredentialType {
   name = 'veeforeApi';
 
-  displayName = 'Veefore Agent API';
+  displayName = 'Veefore API';
 
   documentationUrl = 'https://docs.veefore.com/build/n8n';
 
@@ -61,21 +53,11 @@ export class VeeforeApi implements ICredentialType {
 
   properties: INodeProperties[] = [
     {
-      displayName: 'Gateway URL',
-      name: 'gatewayUrl',
-      type: 'string',
+      displayName:
+        'Create these in the Veefore console: Integrations → n8n → Connect n8n. The connection secret is shown once.',
+      name: 'notice',
+      type: 'notice',
       default: '',
-      placeholder: 'https://gateway.veefore.com',
-      required: true,
-      description: 'The Veefore gateway (enforcement plane), not the console.',
-    },
-    {
-      displayName: 'Agent ID',
-      name: 'agentId',
-      type: 'string',
-      default: '',
-      placeholder: 'agt_…',
-      required: true,
     },
     {
       displayName: 'Key ID',
@@ -84,26 +66,25 @@ export class VeeforeApi implements ICredentialType {
       default: '',
       placeholder: 'key_…',
       required: true,
-      description: 'The identity key ID shown when the agent key was created or rotated.',
+      description: 'Identifies the Veefore agent this n8n acts as',
     },
     {
-      displayName: 'Private Key',
-      name: 'privateKey',
+      displayName: 'Connection Secret',
+      name: 'connectionSecret',
       type: 'string',
-      typeOptions: { password: true, rows: 4 },
+      typeOptions: { password: true },
       default: '',
+      placeholder: 'vf_secret_…',
       required: true,
-      description:
-        'Ed25519 private key: base64 PKCS#8 as Veefore shows it, or PEM. Used only to sign a two-minute identity assertion.',
+      description: 'Proves this n8n holds the key. Never sent to Veefore: it only signs requests.',
     },
     {
-      displayName: 'Runtime Connection ID',
-      name: 'runtimeConnectionId',
+      displayName: 'Gateway URL',
+      name: 'gatewayUrl',
       type: 'string',
-      default: '',
-      placeholder: 'rtc_…',
-      description:
-        'The Veefore runtime this instance is registered as. Sent with each action so Veefore can check it matches the agent’s binding.',
+      default: DEFAULT_GATEWAY_URL,
+      required: true,
+      description: 'Change only for a self-hosted or regional Veefore',
     },
     {
       // Short-lived gateway session token, minted by `preAuthentication`.
@@ -123,9 +104,10 @@ export class VeeforeApi implements ICredentialType {
   ];
 
   /**
-   * Signs a two-minute identity assertion with the agent key and exchanges it
-   * at the gateway for a session token. A wrong key, agent or gateway fails
-   * here, so the credential test proves the identity, not just reachability.
+   * Signs a two-minute identity assertion with the connection secret and
+   * exchanges it at the gateway for a session token. A wrong Key ID, secret or
+   * gateway fails here, so the credential test proves the connection, not
+   * just that the gateway is reachable.
    */
   async preAuthentication(this: IHttpRequestHelper, credentials: ICredentialDataDecryptedObject) {
     const identity = identityFrom(credentials);
@@ -137,10 +119,10 @@ export class VeeforeApi implements ICredentialType {
   }
 
   /**
-   * Presents the stored session token only if it was issued for the identity
-   * currently in the form. After an edit (another agent, key or gateway) the
-   * gateway gets no valid token, answers 401, and n8n runs preAuthentication
-   * again with the new values, so the test checks what was actually entered.
+   * Presents the stored session token only if it was issued for the values
+   * currently in the form. After an edit the gateway gets no valid token,
+   * answers 401, and n8n runs preAuthentication again with the new values, so
+   * the test checks what was actually entered.
    */
   async authenticate(
     credentials: ICredentialDataDecryptedObject,
@@ -157,10 +139,10 @@ export class VeeforeApi implements ICredentialType {
     };
   }
 
-  /** An authenticated read: lists the tools this agent may attempt. */
+  /** An authenticated read: lists the tools this agent may use. */
   test: ICredentialTestRequest = {
     request: {
-      baseURL: '={{$credentials.gatewayUrl.replace(/\\/+$/, "")}}',
+      baseURL: `={{($credentials.gatewayUrl || "${DEFAULT_GATEWAY_URL}").replace(/\\/+$/, "")}}`,
       url: '/gateway/v1/tools',
       method: 'GET',
     },

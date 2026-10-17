@@ -11,12 +11,30 @@ import { createHash, createPrivateKey, randomBytes, sign, type KeyObject } from 
  * Only `node:crypto` is used, which n8n permits for verified community nodes.
  */
 
+/**
+ * What the Veefore console hands out for n8n: the gateway, the agent key's ID
+ * and its connection secret. The key identifies the agent, so no agent ID is
+ * needed; the secret is the key's Ed25519 private half and never leaves n8n.
+ */
 export interface VeeforeCredentials {
   gatewayUrl: string;
-  agentId: string;
   keyId: string;
-  privateKey: string;
-  runtimeConnectionId?: string;
+  /** `vf_secret_…` from the console; a raw base64 PKCS#8 key or PEM also works. */
+  secret: string;
+}
+
+/** Prefix the console puts on a connection secret, so it is recognisable. */
+export const CONNECTION_SECRET_PREFIX = 'vf_secret_';
+export const DEFAULT_GATEWAY_URL = 'https://gateway.veefore.com';
+
+/** Reads the n8n credential's fields (`keyId`, `connectionSecret`, `gatewayUrl`). */
+export function credentialsFromData(data: Record<string, unknown>): VeeforeCredentials {
+  const text = (value: unknown) => (typeof value === 'string' ? value : '');
+  return {
+    gatewayUrl: text(data.gatewayUrl).trim() || DEFAULT_GATEWAY_URL,
+    keyId: text(data.keyId),
+    secret: text(data.connectionSecret),
+  };
 }
 
 export interface HttpResponse {
@@ -91,16 +109,36 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function loadPrivateKey(raw: string): KeyObject {
-  const value = raw.trim();
+  let value = raw.trim();
   if (value.startsWith('-----BEGIN')) return createPrivateKey({ key: value, format: 'pem' });
-  return createPrivateKey({ key: Buffer.from(value, 'base64'), format: 'der', type: 'pkcs8' });
+  if (value.startsWith(CONNECTION_SECRET_PREFIX))
+    value = value.slice(CONNECTION_SECRET_PREFIX.length);
+  let key: KeyObject | null = null;
+  try {
+    // Node's base64 decoder reads both the standard and the URL-safe alphabet.
+    key = createPrivateKey({ key: Buffer.from(value, 'base64'), format: 'der', type: 'pkcs8' });
+  } catch {
+    key = null;
+  }
+  if (!key) {
+    throw new VeeforeGatewayError(
+      'The connection secret is not valid. Copy it again from the Veefore console.',
+      0,
+      'INVALID_CONNECTION_SECRET',
+    );
+  }
+  return key;
 }
 
-/** A compact EdDSA JWS over the identity assertion, valid for two minutes. */
+/**
+ * A compact EdDSA JWS over the identity assertion, valid for two minutes.
+ * The subject is the key: the gateway resolves the agent from it.
+ */
 export function createAssertion(credentials: VeeforeCredentials, now = new Date()): string {
-  const header = { alg: 'EdDSA', kid: credentials.keyId, typ: 'veefore-assertion+jwt' };
+  const keyId = credentials.keyId.trim();
+  const header = { alg: 'EdDSA', kid: keyId, typ: 'veefore-assertion+jwt' };
   const payload = {
-    sub: credentials.agentId,
+    sub: keyId,
     aud: normalizeGateway(credentials.gatewayUrl),
     purpose: 'agent_authentication',
     nonce: randomBytes(16).toString('hex'),
@@ -108,7 +146,7 @@ export function createAssertion(credentials: VeeforeCredentials, now = new Date(
     exp: new Date(now.getTime() + 120_000).toISOString(),
   };
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(canonicalJson(payload))}`;
-  const signature = sign(null, Buffer.from(signingInput), loadPrivateKey(credentials.privateKey));
+  const signature = sign(null, Buffer.from(signingInput), loadPrivateKey(credentials.secret));
   return `${signingInput}.${b64url(signature)}`;
 }
 
@@ -126,10 +164,9 @@ export function identityFingerprint(credentials: Partial<VeeforeCredentials>): s
     .update(
       canonicalJson({
         gateway: normalizeGateway(String(credentials.gatewayUrl ?? '')),
-        agent: String(credentials.agentId ?? '').trim(),
         key: String(credentials.keyId ?? '').trim(),
-        privateKey: createHash('sha256')
-          .update(String(credentials.privateKey ?? '').trim())
+        secret: createHash('sha256')
+          .update(String(credentials.secret ?? '').trim())
           .digest('hex'),
       }),
     )
@@ -194,6 +231,13 @@ export class VeeforeGateway {
     private readonly http: HttpFn,
   ) {
     this.base = normalizeGateway(credentials.gatewayUrl);
+    if (!this.credentials.keyId?.trim() || !this.credentials.secret?.trim()) {
+      throw new VeeforeGatewayError(
+        'Enter the Key ID and connection secret from the Veefore console.',
+        0,
+        'INVALID_REQUEST',
+      );
+    }
     if (!/^https?:\/\//.test(this.base)) {
       throw new VeeforeGatewayError(
         'The gateway URL must start with http:// or https://.',
@@ -204,7 +248,7 @@ export class VeeforeGateway {
   }
 
   private cacheKey(): string {
-    return `${this.base}|${this.credentials.agentId}|${this.credentials.keyId}`;
+    return `${this.base}|${this.credentials.keyId.trim()}`;
   }
 
   async token(force = false): Promise<string> {
@@ -214,7 +258,11 @@ export class VeeforeGateway {
       method: 'POST',
       url: `${this.base}/gateway/v1/token`,
       headers: { 'content-type': 'application/json', accept: 'application/json' },
-      body: { agent_id: this.credentials.agentId, assertion: createAssertion(this.credentials) },
+      body: {
+        key_id: this.credentials.keyId.trim(),
+        assertion: createAssertion(this.credentials),
+        sdk: { name: 'n8n-nodes-veefore', runtime: 'n8n' },
+      },
       timeoutMs: TIMEOUT_MS,
     });
     const data = unwrap(response) as { token?: string; expires_at?: string };
@@ -332,20 +380,44 @@ function unwrapDecision(response: HttpResponse): Record<string, unknown> {
   throw errorOf(response);
 }
 
-/** Polls an approval until it is decided or the wait runs out. */
+/** Longest the node keeps one execution open for a person to decide. */
+export const MAX_APPROVAL_WAIT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Waits for a person to decide an approval in Veefore. There is no timeout to
+ * configure: the approval's own expiry (set by the policy that asked for it)
+ * ends the wait, capped at a day so an approval without one cannot hold an
+ * execution open forever.
+ */
 export async function waitForApproval(
   gateway: VeeforeGateway,
   approvalId: string,
-  waitSeconds: number,
   sleep: (ms: number) => Promise<void>,
+  now: () => number = Date.now,
 ): Promise<string> {
-  const deadline = Date.now() + waitSeconds * 1000;
-  let status = 'PENDING';
-  while (Date.now() < deadline) {
+  const started = now();
+  let deadline = started + MAX_APPROVAL_WAIT_MS;
+  for (;;) {
     const approval = await gateway.approvalStatus(approvalId);
-    status = String(approval.status ?? 'PENDING');
+    const status = String(approval.status ?? 'PENDING');
     if (status !== 'PENDING') return status;
-    await sleep(Math.min(5_000, Math.max(0, deadline - Date.now())));
+    if (typeof approval.expires_at === 'string') {
+      const expires = new Date(approval.expires_at).getTime();
+      // A few seconds' grace so the gateway, not this clock, rules on expiry.
+      if (Number.isFinite(expires)) deadline = Math.min(deadline, expires + 5_000);
+    }
+    if (now() >= deadline) return 'EXPIRED';
+    const pollAfter = Number(approval.poll_after_ms ?? 5_000);
+    await sleep(Math.min(Math.max(pollAfter, 1_000), 15_000, Math.max(0, deadline - now())));
   }
-  return status;
+}
+
+export type Outcome = 'allowed' | 'refused' | 'approval';
+
+/** Which way an execute or authorize answer goes: done, refused, or waiting for a person. */
+export function outcomeOf(decision: Record<string, unknown>): Outcome {
+  if (decision.outcome === 'APPROVAL_REQUIRED' || decision.result === 'REQUIRE_APPROVAL')
+    return 'approval';
+  if (decision.allowed === true || decision.result === 'ALLOW') return 'allowed';
+  return 'refused';
 }

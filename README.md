@@ -16,17 +16,37 @@ Full guide: <https://docs.veefore.com/build/n8n>
 
 Restart n8n afterwards.
 
-## Credential: Veefore Agent API
+## Set up in Veefore first
 
-Gateway URL, agent ID, key ID and the agent's Ed25519 private key, plus the
-optional runtime connection ID from the Veefore console. The key signs a
-two-minute identity assertion; it grants no authority of its own. It is not a
-Veefore administrator credential.
+In the Veefore console open **Integrations → n8n**: choose or create the agent
+n8n acts as, tick the tools it may use, and create the connection secret. You
+get two values.
+
+## Credential: Veefore API
+
+- **Key ID** (`key_…`): names the agent's key.
+- **Connection Secret** (`vf_secret_…`): the key's private half, shown once in
+  the console. It only signs a two-minute identity assertion; Veefore never
+  receives it, and it grants nothing beyond the agent's own tools and policy.
+- **Gateway URL**: prefilled with `https://gateway.veefore.com`.
+
+Saving the credential tests it against the gateway.
 
 ## Operations
 
-Execute action · Authorize (dry run, single-use authorization) · Get approval
-status · List permitted tools. Usable as an AI Agent tool.
+- **Run Tool**: pick a tool (listed live from Veefore) and fill its fields,
+  built from the tool's parameter schema; or send JSON. Three outputs:
+  **Allowed**, **Refused** and **Needs Approval**. Whether a person must
+  approve is decided by your Veefore policy. By default the node waits for that
+  decision, for as long as the approval is open, then runs the approved action
+  or routes to Refused; or choose to continue on **Needs Approval** without
+  waiting.
+- **Check Only**: the decision without running anything.
+- **List Tools** and **Get Approval**.
+
+As **Veefore Tool** on an AI Agent, each parameter is filled by the model with
+its own description, and the result (including "waiting for approval",
+"approved and done" or "refused: reason") comes back to the agent.
 
 ## Important
 
