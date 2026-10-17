@@ -1,0 +1,58 @@
+{
+  "name": "n8n-nodes-veefore",
+  "version": "1.0.0",
+  "description": "Veefore for n8n: run protected actions through Veefore's policy, approval and credential broker, from workflows and AI agents.",
+  "license": "MIT",
+  "homepage": "https://docs.veefore.com/build/n8n",
+  "keywords": [
+    "n8n-community-node-package",
+    "veefore",
+    "ai-agent",
+    "authorization",
+    "policy"
+  ],
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.15"
+  },
+  "scripts": {
+    "build": "n8n-node build",
+    "lint": "n8n-node lint",
+    "lint:fix": "n8n-node lint --fix",
+    "dev": "n8n-node dev",
+    "release": "n8n-node release",
+    "prepublishOnly": "n8n-node prerelease"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "strict": true,
+    "credentials": [
+      "dist/credentials/VeeforeApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/Veefore/Veefore.node.js"
+    ]
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "devDependencies": {
+    "@n8n/node-cli": "0.52.5",
+    "@types/node": "20.19.43",
+    "eslint": "9.29.0",
+    "n8n-workflow": "2.43.5",
+    "release-it": "20.2.1",
+    "typescript": "5.6.3"
+  },
+  "author": {
+    "name": "Veefore",
+    "email": "veefedtechnologies@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/veefedtechnologies-coder/n8n-nodes-veefore.git"
+  }
+}

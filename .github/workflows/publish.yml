@@ -1,0 +1,50 @@
+# Publishes n8n-nodes-veefore to npm with a provenance statement.
+#
+# n8n accepts nodes for verification only when they are published from GitHub
+# Actions with provenance (since 1 May 2026), and npm generates provenance only
+# from a PUBLIC repository. This file belongs at the root of the public
+# repository that holds this package (for example veefore/n8n-nodes-veefore),
+# not in the private monorepo.
+#
+# One-time setup (OIDC trusted publishing, no long-lived token):
+#   npmjs.com → package n8n-nodes-veefore → Settings → Publish access →
+#   Trusted Publishers → Add → GitHub Actions:
+#     Repository owner: <org>   Repository name: n8n-nodes-veefore
+#     Workflow name:    publish.yml
+#
+# Release: run `npm run release` locally. It lints, builds, bumps the version,
+# tags and pushes; the tag triggers this workflow.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Release
+        run: |
+          [ -n "$NPM_TOKEN" ] && npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          npm run release
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
