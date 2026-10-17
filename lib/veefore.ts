@@ -371,12 +371,22 @@ function unwrap(response: HttpResponse): unknown {
 }
 
 /**
- * Decisions come back with a body on 202/403/502 too. Those are answers, not
+ * Decisions come back with a body on 202/403/424 too. Those are answers, not
  * transport errors: return them so the node can report exactly what happened.
+ * A 5xx without Veefore's body was answered by something in front of the
+ * gateway; nothing says whether the action ran, so it is reported as such.
  */
 function unwrapDecision(response: HttpResponse): Record<string, unknown> {
   const data = (response.body as { data?: Record<string, unknown> } | null)?.data;
   if (data && typeof data === 'object') return { ...data, http_status: response.status };
+  const hasVeefore = Boolean((response.body as { error?: unknown } | null)?.error);
+  if (!hasVeefore && response.status >= 500) {
+    throw new VeeforeGatewayError(
+      `No decision came back from Veefore (HTTP ${response.status} from the network in front of the gateway). Check Actions in the Veefore console before retrying; do not assume it did or did not happen.`,
+      response.status,
+      'GATEWAY_UNREACHABLE',
+    );
+  }
   throw errorOf(response);
 }
 
