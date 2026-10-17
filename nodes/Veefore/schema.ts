@@ -16,6 +16,34 @@ export interface JsonSchema {
   enum?: unknown[];
   properties?: Record<string, JsonSchema>;
   required?: string[];
+  items?: JsonSchema;
+}
+
+/**
+ * A list of plain values (emails, ids, tags). Shown as one text field where
+ * values are separated by commas, not as a JSON editor, and split on run.
+ */
+export function isScalarList(schema: JsonSchema): boolean {
+  if (typeOf(schema) !== 'array') return false;
+  const item = schema.items ? typeOf(schema.items) : 'string';
+  return item === 'string' || item === 'number' || item === 'integer' || item === 'boolean';
+}
+
+/** `a@x.com, b@x.com` (or a JSON array, or one per line) → `['a@x.com', 'b@x.com']`. */
+export function splitList(value: string): string[] {
+  const text = value.trim();
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {
+      // Not JSON: split below.
+    }
+  }
+  return text
+    .split(/[,;\n]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
 const AI_KEY = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -27,6 +55,7 @@ function typeOf(schema: JsonSchema): string {
 
 function fieldType(schema: JsonSchema): FieldType {
   if (Array.isArray(schema.enum) && schema.enum.length > 0) return 'options';
+  if (isScalarList(schema)) return 'string';
   switch (typeOf(schema)) {
     case 'integer':
     case 'number':
@@ -43,6 +72,7 @@ function fieldType(schema: JsonSchema): FieldType {
 }
 
 function fromAiType(schema: JsonSchema): 'string' | 'number' | 'boolean' | 'json' {
+  if (isScalarList(schema)) return 'string';
   switch (typeOf(schema)) {
     case 'integer':
     case 'number':
@@ -79,10 +109,15 @@ export function fieldsFromSchema(
   options: { fromAi: boolean },
 ): ResourceMapperField[] {
   const required = new Set(schema.required ?? []);
-  return Object.entries(schema.properties ?? {}).map(([id, property]) => {
+  // Required fields first, so what must be filled in is at the top.
+  const entries = Object.entries(schema.properties ?? {}).sort(
+    ([a], [b]) => Number(required.has(b)) - Number(required.has(a)),
+  );
+  return entries.map(([id, property]) => {
     const type = fieldType(property);
-    const label = property.title || labelFor(id);
-    const description = property.description || label;
+    const list = isScalarList(property);
+    const label = `${property.title || labelFor(id)}${list ? ' (separate with commas)' : ''}`;
+    const description = `${property.description || labelFor(id)}${list ? '. Several values separated by commas' : ''}`;
     const field: ResourceMapperField = {
       id,
       displayName: label,
@@ -107,15 +142,33 @@ export function fieldsFromSchema(
   });
 }
 
-/** Mapped values → tool parameters: blanks dropped, JSON fields parsed, types kept. */
+/**
+ * Mapped values → tool parameters: blanks dropped, JSON fields parsed, types
+ * kept. With the tool's schema, a list field typed as text is split into a list.
+ */
 export function parametersFromMapper(
   mapper: Pick<ResourceMapperValue, 'value' | 'schema'> | null | undefined,
+  toolSchema?: JsonSchema,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const types = new Map((mapper?.schema ?? []).map((field) => [field.id, field.type]));
+  const properties = toolSchema?.properties ?? {};
   for (const [key, value] of Object.entries(mapper?.value ?? {})) {
     if (value === undefined || value === null || value === '') continue;
     const type = types.get(key);
+    const property = properties[key];
+    if (property && isScalarList(property)) {
+      const items = Array.isArray(value) ? value.map(String) : splitList(String(value));
+      if (items.length === 0) continue;
+      const itemType = property.items ? typeOf(property.items) : 'string';
+      out[key] =
+        itemType === 'number' || itemType === 'integer'
+          ? items.map((item) => (Number.isFinite(Number(item)) ? Number(item) : item))
+          : itemType === 'boolean'
+            ? items.map((item) => (item === 'true' ? true : item === 'false' ? false : item))
+            : items;
+      continue;
+    }
     if ((type === 'object' || type === 'array') && typeof value === 'string') {
       try {
         out[key] = JSON.parse(value);

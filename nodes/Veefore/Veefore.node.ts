@@ -342,6 +342,16 @@ export class Veefore implements INodeType {
       step: node.name,
     };
 
+    // The tool's own schema, fetched once per run, so list fields typed as
+    // text ("a@x.com, b@x.com") reach Veefore as lists.
+    let toolList: Array<Record<string, unknown>> | null = null;
+    const toolSchema = async (key: string): Promise<JsonSchema | undefined> => {
+      toolList ??= await gateway.tools();
+      return toolList.find((entry) => entry.key === key)?.parameter_schema as
+        | JsonSchema
+        | undefined;
+    };
+
     const outputs: INodeExecutionData[][] = [[], [], []];
     const emit = (outcome: Outcome, json: IDataObject, itemIndex: number) => {
       // An AI agent reads only the first output; it gets every outcome there.
@@ -390,6 +400,7 @@ export class Veefore implements INodeType {
               )
             : parametersFromMapper(
                 this.getNodeParameter('parameters', itemIndex, null) as ResourceMapperValue | null,
+                await toolSchema(tool),
               );
         const options = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
         const idempotencyKey = itemIdempotencyKey({
