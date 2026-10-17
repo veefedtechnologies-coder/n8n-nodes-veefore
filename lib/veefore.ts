@@ -123,16 +123,39 @@ export function approvalReplayKey(original: string, approvalId: string): string 
   return `${createHash('sha256').update(composed).digest('hex')}:approved`;
 }
 
-/** A stable per-item key, so re-running a step in the same execution cannot act twice. */
-export function itemIdempotencyKey(
-  executionId: string | null,
-  node: string,
-  itemIndex: number,
-  override?: string,
-): string {
+export interface IdempotencyScope {
+  /** n8n's instance id: execution ids only count up within one instance. */
+  instanceId: string | null;
+  workflowId: string | null;
+  executionId: string | null;
+  node: string;
+  itemIndex: number;
+  tool: string;
+  action?: string;
+  parameters: Record<string, unknown>;
+}
+
+/**
+ * The default idempotency key: the same request from the same step, item and
+ * execution on the same n8n instance gets the same key, so a retried step
+ * cannot act twice. A different instance, workflow or execution, or different
+ * arguments (an AI agent calling the tool again with new ones), gets a new key.
+ * Without an execution id there is nothing to dedupe against, so the key is
+ * unique per call.
+ */
+export function itemIdempotencyKey(scope: IdempotencyScope, override?: string): string {
   if (override && override.trim().length > 0) return override.trim().slice(0, 200);
-  const base = `n8n:${executionId ?? 'manual'}:${node}:${itemIndex}`;
-  return base.length <= 200 ? base : createHash('sha256').update(base).digest('hex');
+  const material = canonicalJson({
+    instance: scope.instanceId,
+    workflow: scope.workflowId,
+    execution: scope.executionId ?? `none:${randomBytes(16).toString('hex')}`,
+    node: scope.node,
+    item: scope.itemIndex,
+    tool: scope.tool,
+    action: scope.action ?? null,
+    parameters: scope.parameters,
+  });
+  return `n8n:${createHash('sha256').update(material).digest('hex')}`;
 }
 
 interface CachedToken {

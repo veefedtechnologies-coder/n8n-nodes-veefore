@@ -197,7 +197,8 @@ export class Veefore implements INodeType {
             name: 'idempotencyKey',
             type: 'string',
             default: '',
-            description: 'Defaults to execution, node and item, so a retried step cannot act twice',
+            description:
+              'Defaults to instance, execution, step, item and arguments, so a retried step cannot act twice',
           },
           {
             displayName: 'Purpose',
@@ -232,6 +233,12 @@ export class Veefore implements INodeType {
       instance = this.getInstanceBaseUrl();
     } catch {
       instance = null;
+    }
+    let instanceId: string | null = null;
+    try {
+      instanceId = this.getInstanceId() || null;
+    } catch {
+      instanceId = null;
     }
     const runtime = {
       connectionId: credentials.runtimeConnectionId ?? null,
@@ -274,9 +281,16 @@ export class Veefore implements INodeType {
         const options = this.getNodeParameter('options', itemIndex, {}) as IDataObject;
         const failOnRefusal = options.failOnRefusal !== false;
         const idempotencyKey = itemIdempotencyKey(
-          runtime.executionId,
-          node.name,
-          itemIndex,
+          {
+            instanceId: instanceId ?? instance,
+            workflowId: runtime.workflowId,
+            executionId: runtime.executionId,
+            node: node.name,
+            itemIndex,
+            tool,
+            action,
+            parameters,
+          },
           options.idempotencyKey as string | undefined,
         );
         const base = {
