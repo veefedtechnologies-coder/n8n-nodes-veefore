@@ -2,11 +2,8 @@ import {
   NodeConnectionTypes,
   NodeOperationError,
   sleep,
-  type ICredentialTestFunctions,
-  type ICredentialsDecrypted,
   type IDataObject,
   type IExecuteFunctions,
-  type INodeCredentialTestResult,
   type INodeExecutionData,
   type INodeType,
   type INodeTypeDescription,
@@ -62,23 +59,6 @@ function httpForExecute(helpers: IExecuteFunctions['helpers']): HttpFn {
   };
 }
 
-/** Credential tests only get the legacy request helper. */
-function httpForTest(helpers: ICredentialTestFunctions['helpers']): HttpFn {
-  return async (request) => {
-    const response = (await helpers.request({
-      method: request.method,
-      uri: request.url,
-      headers: request.headers,
-      body: request.body,
-      json: true,
-      timeout: request.timeoutMs,
-      resolveWithFullResponse: true,
-      simple: false,
-    })) as { statusCode: number; headers: Record<string, string>; body: unknown };
-    return { status: response.statusCode, headers: response.headers, body: response.body };
-  };
-}
-
 function parseParameters(
   node: IExecuteFunctions,
   raw: unknown,
@@ -111,7 +91,7 @@ export class Veefore implements INodeType {
     inputs: [NodeConnectionTypes.Main],
     outputs: [NodeConnectionTypes.Main],
     usableAsTool: true,
-    credentials: [{ name: 'veeforeApi', required: true, testedBy: 'veeforeApiTest' }],
+    credentials: [{ name: 'veeforeApi', required: true }],
     properties: [
       {
         displayName: 'Operation',
@@ -239,30 +219,6 @@ export class Veefore implements INodeType {
         ],
       },
     ],
-  };
-
-  methods = {
-    credentialTest: {
-      async veeforeApiTest(
-        this: ICredentialTestFunctions,
-        credential: ICredentialsDecrypted,
-      ): Promise<INodeCredentialTestResult> {
-        try {
-          const gateway = new VeeforeGateway(
-            credentialsFrom(credential.data ?? {}),
-            httpForTest(this.helpers),
-          );
-          await gateway.token(true);
-          return { status: 'OK', message: 'Veefore accepted the agent identity.' };
-        } catch (error) {
-          return {
-            status: 'Error',
-            message:
-              error instanceof Error ? error.message : 'Veefore did not accept the agent identity.',
-          };
-        }
-      },
-    },
   };
 
   async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {

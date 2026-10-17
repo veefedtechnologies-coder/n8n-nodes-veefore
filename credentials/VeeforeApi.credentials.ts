@@ -1,4 +1,30 @@
-import type { ICredentialType, INodeProperties } from 'n8n-workflow';
+import type {
+  IAuthenticateGeneric,
+  ICredentialDataDecryptedObject,
+  ICredentialTestRequest,
+  ICredentialType,
+  IDataObject,
+  IHttpRequestHelper,
+  INodeProperties,
+} from 'n8n-workflow';
+import { VeeforeGateway, type HttpFn } from '../lib/veefore';
+
+/** Adapts the helper n8n hands to `preAuthentication` to the protocol's HttpFn. */
+function httpFrom(helper: IHttpRequestHelper): HttpFn {
+  return async (request) => {
+    const response = (await helper.helpers.httpRequest({
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
+      body: request.body as IDataObject | undefined,
+      json: true,
+      timeout: request.timeoutMs,
+      returnFullResponse: true,
+      ignoreHttpStatusErrors: true,
+    })) as { statusCode: number; headers: Record<string, string>; body: unknown };
+    return { status: response.statusCode, headers: response.headers, body: response.body };
+  };
+}
 
 /**
  * The agent's identity, held by n8n's encrypted credential store.
@@ -65,5 +91,49 @@ export class VeeforeApi implements ICredentialType {
       description:
         'The Veefore runtime this instance is registered as. Sent with each action so Veefore can check it matches the agent’s binding.',
     },
+    {
+      // Short-lived gateway session token, minted by `preAuthentication`.
+      displayName: 'Session Token',
+      name: 'sessionToken',
+      type: 'hidden',
+      typeOptions: { expirable: true, password: true },
+      default: '',
+    },
   ];
+
+  /**
+   * Signs a two-minute identity assertion with the agent key and exchanges it
+   * at the gateway for a session token. A wrong key, agent or gateway fails
+   * here, so the credential test proves the identity, not just reachability.
+   */
+  async preAuthentication(this: IHttpRequestHelper, credentials: ICredentialDataDecryptedObject) {
+    const gateway = new VeeforeGateway(
+      {
+        gatewayUrl: String(credentials.gatewayUrl ?? ''),
+        agentId: String(credentials.agentId ?? ''),
+        keyId: String(credentials.keyId ?? ''),
+        privateKey: String(credentials.privateKey ?? ''),
+      },
+      httpFrom(this),
+    );
+    return { sessionToken: await gateway.token(true) };
+  }
+
+  authenticate: IAuthenticateGeneric = {
+    type: 'generic',
+    properties: {
+      headers: {
+        Authorization: '=Bearer {{$credentials.sessionToken}}',
+      },
+    },
+  };
+
+  /** An authenticated read: lists the tools this agent may attempt. */
+  test: ICredentialTestRequest = {
+    request: {
+      baseURL: '={{$credentials.gatewayUrl.replace(/\\/+$/, "")}}',
+      url: '/gateway/v1/tools',
+      method: 'GET',
+    },
+  };
 }
