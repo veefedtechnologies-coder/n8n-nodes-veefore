@@ -14,6 +14,7 @@ import {
   type ResourceMapperValue,
 } from 'n8n-workflow';
 import {
+  TOOL_APPROVAL_WAIT_MS,
   VeeforeGateway,
   VeeforeGatewayError,
   approvalReplayKey,
@@ -65,7 +66,7 @@ function httpFrom(helpers: Http): HttpFn {
 
 async function gatewayFor(context: IExecuteFunctions | ILoadOptionsFunctions) {
   const data = (await context.getCredentials('veeforeApi')) as IDataObject;
-  return new VeeforeGateway(credentialsFromData(data), httpFrom(context.helpers));
+  return new VeeforeGateway(credentialsFromData(data), httpFrom(context.helpers), sleep);
 }
 
 const OUTPUT_INDEX: Record<Outcome, number> = { allowed: 0, refused: 1, approval: 2 };
@@ -434,12 +435,43 @@ export class Veefore implements INodeType {
         let decision = await gateway.execute(base);
         let outcome = outcomeOf(decision);
         let approvalStatus: string | undefined;
-        const approval = decision.approval as { approval_id?: string } | null | undefined;
+        const approval = decision.approval as
+          | { approval_id?: string; expires_at?: string }
+          | null
+          | undefined;
         const onApproval = asTool
           ? 'wait'
           : (this.getNodeParameter('onApproval', itemIndex, 'wait') as string);
         if (outcome === 'approval' && approval?.approval_id && onApproval === 'wait') {
-          approvalStatus = await waitForApproval(gateway, approval.approval_id, sleep);
+          // An AI agent answers its chat after a short wait; a workflow waits
+          // for as long as the approval is open.
+          approvalStatus = await waitForApproval(
+            gateway,
+            approval.approval_id,
+            sleep,
+            Date.now,
+            asTool ? TOOL_APPROVAL_WAIT_MS : undefined,
+          );
+          if (approvalStatus === 'PENDING') {
+            // Still undecided: Veefore carries it out if it is approved later.
+            const handover = await gateway
+              .handOver(approval.approval_id, base)
+              .then((answer) => ({ ok: true as const, answer }))
+              .catch((error: Error) => ({ ok: false as const, error }));
+            emit(
+              'approval',
+              {
+                ...summarize('approval', decision, 'PENDING'),
+                message: handover.ok
+                  ? handedOverMessage(approval.expires_at)
+                  : notHandedOverMessage(approval.expires_at, handover.error.message),
+                handed_over: handover.ok,
+                expires_at: approval.expires_at ?? null,
+              },
+              itemIndex,
+            );
+            continue;
+          }
           if (approvalStatus === 'APPROVED') {
             decision = await gateway.execute({
               ...base,
@@ -471,6 +503,28 @@ export class Veefore implements INodeType {
     }
     return asTool ? [outputs[0]!] : outputs;
   }
+}
+
+/** When the approval runs out, in words. */
+function untilText(expiresAt: string | undefined): string {
+  if (!expiresAt) return 'before the approval expires';
+  const minutes = Math.max(1, Math.round((new Date(expiresAt).getTime() - Date.now()) / 60_000));
+  const when = new Date(expiresAt).toISOString().replace('T', ' ').slice(0, 16);
+  if (minutes >= 120) {
+    const hours = Math.round(minutes / 60);
+    return `within about ${hours} hours (by ${when} UTC)`;
+  }
+  return `within about ${minutes} minute${minutes === 1 ? '' : 's'} (by ${when} UTC)`;
+}
+
+/** What the chat should say once Veefore has taken it over. */
+function handedOverMessage(expiresAt: string | undefined): string {
+  return `Not done yet: a person must approve this in Veefore first. Veefore will carry it out automatically if they approve it ${untilText(expiresAt)}; nothing more is needed from you or the user. If they deny it or no one decides in time, it will not happen. Tell the user exactly this, and do not call this tool again for the same request.`;
+}
+
+/** The action cannot be done later by Veefore (n8n performs it, or the hand-over failed). */
+function notHandedOverMessage(expiresAt: string | undefined, why: string): string {
+  return `Not done yet: a person must approve this in Veefore first, and it will not happen on its own (${why.replace(/\.$/, '')}). Tell the user it is waiting for approval, and that once it is approved ${untilText(expiresAt)} they should ask again; then call this tool again with the same request.`;
 }
 
 function checkMessage(outcome: Outcome, decision: Record<string, unknown>): string {

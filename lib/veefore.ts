@@ -88,6 +88,63 @@ export class VeeforeGatewayError extends Error {
 }
 
 const TIMEOUT_MS = 30_000;
+/**
+ * An action can take a while on the gateway: renewing an OAuth token, the
+ * provider's own call, and lookups before it (Gmail's reply reads the message
+ * first). Waiting less than that reports a timeout for an action that is
+ * still running.
+ */
+const ACTION_TIMEOUT_MS = 120_000;
+
+/** Pauses between attempts of a call that is safe to repeat. */
+const RETRY_DELAYS_MS = [1_000, 3_000, 8_000];
+
+/**
+ * A failure that says nothing about the request itself: a timeout, a dropped
+ * connection, or a 5xx with no Veefore answer (the network in front of the
+ * gateway). Repeating a safe call is the right response.
+ */
+export function isTransient(error: unknown): boolean {
+  if (error instanceof VeeforeGatewayError) {
+    return error.code === 'GATEWAY_UNREACHABLE' || error.code === 'NETWORK';
+  }
+  const text = String((error as { message?: unknown })?.message ?? error);
+  const code = String((error as { code?: unknown })?.code ?? '');
+  return (
+    /timeout|timed out|socket hang up|ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|EAI_AGAIN|network|aborted/i.test(
+      text,
+    ) || /^(ECONN|ETIMEDOUT|EAI_AGAIN|EPIPE|ECONNABORTED|ERR_NETWORK)/.test(code)
+  );
+}
+
+/** The error to report: the gateway's own, or a network failure as one. */
+function asGatewayError(error: unknown): VeeforeGatewayError {
+  if (error instanceof VeeforeGatewayError) return error;
+  const message = String((error as { message?: unknown })?.message ?? error);
+  if (!isTransient(error)) return new VeeforeGatewayError(message, 0, null);
+  return new VeeforeGatewayError(
+    `Could not reach the Veefore gateway (${message}). Check Actions in the Veefore console before retrying; do not assume it did or did not happen.`,
+    0,
+    'NETWORK',
+  );
+}
+
+/** Runs a call that is safe to repeat (a read, or a request carrying its idempotency key). */
+export async function withRetries<T>(
+  attempt: () => Promise<T>,
+  sleep?: (ms: number) => Promise<void>,
+): Promise<T> {
+  for (let tries = 0; ; tries += 1) {
+    let failure: unknown;
+    try {
+      return await attempt();
+    } catch (error) {
+      failure = error;
+    }
+    if (tries >= RETRY_DELAYS_MS.length || !isTransient(failure)) throw asGatewayError(failure);
+    await sleep?.(RETRY_DELAYS_MS[tries]!);
+  }
+}
 
 function b64url(input: Buffer | string): string {
   return Buffer.from(input).toString('base64url');
@@ -229,6 +286,8 @@ export class VeeforeGateway {
   constructor(
     private readonly credentials: VeeforeCredentials,
     private readonly http: HttpFn,
+    /** How retries wait; n8n's own sleep in the node. */
+    private readonly sleep?: (ms: number) => Promise<void>,
   ) {
     this.base = normalizeGateway(credentials.gatewayUrl);
     if (!this.credentials.keyId?.trim() || !this.credentials.secret?.trim()) {
@@ -279,7 +338,12 @@ export class VeeforeGateway {
     return data.token;
   }
 
-  private async call(method: 'GET' | 'POST', path: string, body?: unknown): Promise<HttpResponse> {
+  private async call(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+    timeoutMs = TIMEOUT_MS,
+  ): Promise<HttpResponse> {
     let token = await this.token();
     const send = () =>
       this.http({
@@ -291,7 +355,7 @@ export class VeeforeGateway {
           ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
         },
         body,
-        timeoutMs: TIMEOUT_MS,
+        timeoutMs,
       });
     let response = await send();
     // A token can expire or be superseded by a key rotation between calls.
@@ -336,18 +400,47 @@ export class VeeforeGateway {
   }
 
   /** Executes through the full pipeline. A non-2xx means the action did not happen. */
+  /**
+   * Executes through the full pipeline. A non-2xx means the action did not happen.
+   *
+   * Every attempt carries the same idempotency key, so a call that timed out
+   * after the gateway acted is not acted on twice: the repeat gets the
+   * recorded result.
+   */
   async execute(input: ActionInput): Promise<Record<string, unknown>> {
     const path = input.approvalId ? '/gateway/v1/actions/retry' : '/gateway/v1/actions';
-    const response = await this.call('POST', path, this.actionBody(input));
-    return unwrapDecision(response);
+    const body = this.actionBody(input);
+    return withRetries(
+      async () => unwrapDecision(await this.call('POST', path, body, ACTION_TIMEOUT_MS)),
+      this.sleep,
+    );
   }
 
   async approvalStatus(approvalId: string): Promise<Record<string, unknown>> {
-    const response = await this.call(
-      'GET',
-      `/gateway/v1/approvals/${encodeURIComponent(approvalId)}`,
-    );
-    return unwrap(response) as Record<string, unknown>;
+    return withRetries(async () => {
+      const response = await this.call(
+        'GET',
+        `/gateway/v1/approvals/${encodeURIComponent(approvalId)}`,
+      );
+      return unwrap(response) as Record<string, unknown>;
+    }, this.sleep);
+  }
+
+  /**
+   * Hands a held request over to Veefore: it carries it out itself if a
+   * person approves it before the approval expires. Refused (409/422) for an
+   * action Veefore does not perform.
+   */
+  async handOver(approvalId: string, input: ActionInput): Promise<Record<string, unknown>> {
+    const body = this.actionBody({ ...input, approvalId: undefined });
+    return withRetries(async () => {
+      const response = await this.call(
+        'POST',
+        `/gateway/v1/approvals/${encodeURIComponent(approvalId)}/handover`,
+        body,
+      );
+      return unwrap(response) as Record<string, unknown>;
+    }, this.sleep);
   }
 
   async tools(): Promise<Array<Record<string, unknown>>> {
@@ -390,13 +483,20 @@ function unwrapDecision(response: HttpResponse): Record<string, unknown> {
   throw errorOf(response);
 }
 
+/**
+ * How long an AI agent's tool call waits for a person before answering the
+ * chat. Beyond this the request is handed to Veefore, which carries it out
+ * when it is approved.
+ */
+export const TOOL_APPROVAL_WAIT_MS = 2 * 60 * 1000;
+
 /** Longest the node keeps one execution open for a person to decide. */
-export const MAX_APPROVAL_WAIT_MS = 24 * 60 * 60 * 1000;
+export const MAX_APPROVAL_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Waits for a person to decide an approval in Veefore. There is no timeout to
  * configure: the approval's own expiry (set by the policy that asked for it)
- * ends the wait, capped at a day so an approval without one cannot hold an
+ * ends the wait (24 hours by default), capped at a week, as approvals are, so one cannot hold an
  * execution open forever.
  */
 export async function waitForApproval(
@@ -404,9 +504,12 @@ export async function waitForApproval(
   approvalId: string,
   sleep: (ms: number) => Promise<void>,
   now: () => number = Date.now,
+  /** Stop waiting after this long and report 'PENDING' (an AI agent in a chat). */
+  maxWaitMs?: number,
 ): Promise<string> {
   const started = now();
   let deadline = started + MAX_APPROVAL_WAIT_MS;
+  const giveUp = maxWaitMs === undefined ? Infinity : started + maxWaitMs;
   for (;;) {
     const approval = await gateway.approvalStatus(approvalId);
     const status = String(approval.status ?? 'PENDING');
@@ -417,8 +520,16 @@ export async function waitForApproval(
       if (Number.isFinite(expires)) deadline = Math.min(deadline, expires + 5_000);
     }
     if (now() >= deadline) return 'EXPIRED';
+    if (now() >= giveUp) return 'PENDING';
     const pollAfter = Number(approval.poll_after_ms ?? 5_000);
-    await sleep(Math.min(Math.max(pollAfter, 1_000), 15_000, Math.max(0, deadline - now())));
+    await sleep(
+      Math.min(
+        Math.max(pollAfter, 1_000),
+        15_000,
+        Math.max(0, deadline - now()),
+        Math.max(0, giveUp - now()),
+      ),
+    );
   }
 }
 
