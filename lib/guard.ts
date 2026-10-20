@@ -1,10 +1,8 @@
+import type { ActionInput } from './veefore';
+
 /**
- * Veefore Guard: n8n tools that run only after Veefore allows the call.
- *
- * In an AI Agent, tools wired into the Guard are offered to the model as
- * usual, but n8n runs the Guard first for each call (its human-in-the-loop
- * tool gate) and runs the tool only when the Guard answers `approved: true`.
- * The Guard asks the Veefore gateway: policy, risk and approvals decide.
+ * n8n tools that run only after Veefore allows the call (the n8n Tools input
+ * of Veefore Tools). The Veefore gateway decides: policy, risk and approvals.
  *
  * This file holds the decisions, with no n8n imports, so they are tested on
  * their own:
@@ -157,6 +155,8 @@ export interface GuardAnswer {
   approved: boolean;
   /** For a refusal, what the agent should take from it (n8n passes it to the model). */
   chatInput?: string;
+  /** Still waiting for a person: what Veefore holds the approval for. */
+  pending?: { approvalId: string; expiresAt: string | null; request: ActionInput };
   veefore: Record<string, unknown>;
 }
 
@@ -173,6 +173,8 @@ function until(expiresAt: unknown): string {
 
 export const GUARD_MESSAGES = {
   allowed: 'Veefore allowed this. The tool runs now.',
+  pendingFollowed: (tool: string, expiresAt: unknown) =>
+    `Veefore: "${tool}" is NOT done yet. A person must approve it in Veefore first, and has not decided yet. Once they approve it (it can be approved ${until(expiresAt)}), it is done automatically, exactly once; nothing more is needed from you or the user. If they deny it, it will not happen. Tell the user exactly this, and do not call this tool again for the same request.`,
   pending: (tool: string, expiresAt: unknown) =>
     `Veefore: "${tool}" was NOT done. A person must approve it in Veefore first, and has not decided yet. Tell the user exactly this: it is waiting for approval, and once it is approved they can ask again (it can be approved ${until(expiresAt)}). When they do, call this tool again with exactly the same arguments; it will then go ahead without a second approval.`,
   refused: (tool: string, reason: string) =>

@@ -35,7 +35,8 @@ import {
   type PlanEntry,
   type RawAction,
 } from '../../lib/agent-tools';
-import { decideN8nCall, originOf, runVeeforeCall } from '../Veefore/calls';
+import { GUARD_MESSAGES } from '../../lib/guard';
+import { decideN8nCall, followApproval, originOf, runVeeforeCall } from '../Veefore/calls';
 import { gatewayFor } from '../Veefore/gateway';
 import { fieldsFromSchema, type JsonSchema } from '../Veefore/schema';
 
@@ -68,6 +69,11 @@ interface Prepared {
 }
 
 const ACTIONS = 'actions.action';
+
+function sendWhenApprovedOf(context: Context, itemIndex: number): boolean {
+  const options = context.getNodeParameter('options', itemIndex, {}) as IDataObject;
+  return options.sendWhenApproved !== false;
+}
 
 function waitMsOf(context: Context, itemIndex: number): number {
   const options = context.getNodeParameter('options', itemIndex, {}) as IDataObject;
@@ -190,9 +196,29 @@ async function callTool(
     purpose: entry.config.purpose,
   });
   if (!answer.approved) {
+    let message = answer.chatInput ?? 'Veefore did not allow this. It was NOT done.';
+    if (answer.pending && sendWhenApprovedOf(context, itemIndex)) {
+      // The agent answers now; the call is made once a person approves it.
+      // By then the run has ended and released n8n's expression engine, which
+      // the tool needs to read its $fromAI fields: hold it again for the call.
+      const connected = entry.connected;
+      const expression = (
+        context as unknown as {
+          workflow?: { expression?: { withIsolate?: <T>(fn: () => Promise<T>) => Promise<T> } };
+        }
+      ).workflow?.expression;
+      const perform = () =>
+        typeof expression?.withIsolate === 'function'
+          ? expression.withIsolate(() => connected.invoke(args))
+          : connected.invoke(args);
+      void followApproval(prepared.gateway, answer.pending, perform, {
+        log: (text, meta) => context.logger?.info(`${text} (${node.name}: ${label})`, meta),
+      });
+      message = GUARD_MESSAGES.pendingFollowed(label, answer.pending.expiresAt);
+    }
     return {
       status: String(answer.veefore.status ?? 'refused'),
-      message: answer.chatInput ?? 'Veefore did not allow this. It was NOT done.',
+      message,
       veefore: answer.veefore as IDataObject,
     };
   }
@@ -344,13 +370,21 @@ export class VeeforeTools implements INodeType {
         default: {},
         options: [
           {
+            displayName: 'Do It When Approved Later',
+            name: 'sendWhenApproved',
+            type: 'boolean',
+            default: true,
+            description:
+              'Whether an action n8n performs runs by itself once a person approves it after the agent stopped waiting. n8n must keep running until then; otherwise the user asks again once it is approved.',
+          },
+          {
             displayName: 'Wait for a Decision (Minutes)',
             name: 'waitMinutes',
             type: 'number',
             typeOptions: { minValue: 0, maxValue: 1440 },
             default: 2,
             description:
-              'When a person must approve, how long the agent waits before answering. An action Veefore performs is then carried out by Veefore if it is approved later; for one n8n performs, the user asks again once it is approved.',
+              'When a person must approve, how long the agent waits before answering. After that the action still happens once it is approved: Veefore performs its own actions, and this node runs the n8n ones (see the option above).',
           },
         ],
       },

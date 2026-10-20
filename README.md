@@ -62,10 +62,11 @@ Name**, **Tool Description** and **Purpose** (shown to approvers).
 
 Allowed: it runs once. Refused: nothing runs, and the model is told why. Needs
 approval: the node waits up to **Wait for a Decision** (2 minutes by default).
-Still undecided: an action Veefore performs is carried out by Veefore if it is
-approved later; for one n8n performs, the user asks again once approved and the
-identical call goes ahead without a second approval. No answer from Veefore
-means nothing runs.
+Still undecided, the agent answers, and the action still happens, once, when a
+person approves it: Veefore carries out its own actions, and the node runs the
+n8n tool for the ones n8n performs (while n8n keeps running; after a restart,
+the user asks again and the identical call goes ahead without a second
+approval). No answer from Veefore means nothing runs.
 
 2.3.0 removed **Veefore Tool** (one action per node) and **Veefore Guard**:
 replace either with Veefore Tools and add the same action.

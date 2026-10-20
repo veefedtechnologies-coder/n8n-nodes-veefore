@@ -193,6 +193,97 @@ export async function runVeeforeCall(
   return summarize(outcome, decision, approvalStatus);
 }
 
+/** A call still waiting for a person when the agent answered. */
+export interface PendingCall {
+  approvalId: string;
+  expiresAt: string | null;
+  /** The exact request Veefore holds the approval for. */
+  request: ActionInput;
+}
+
+export type FollowOutcome = 'performed' | 'denied' | 'expired' | 'refused' | 'error';
+
+/** Approvals being followed in this n8n process: one follower each. */
+const following = new Map<string, Promise<FollowOutcome>>();
+
+/** How often a follower asks: every 10 s for 10 minutes, then every minute. */
+export function followInterval(elapsedMs: number): number {
+  return elapsedMs < 10 * 60_000 ? 10_000 : 60_000;
+}
+
+/**
+ * Keeps waiting for a held n8n-performed call after the agent has answered,
+ * and performs it with the n8n tool once a person approves it.
+ *
+ * The run itself is claimed from Veefore with the approval (consumed once,
+ * atomically), so the action happens at most once even if the user also asks
+ * again: whichever comes first runs it, the other is refused. A denial or an
+ * expiry ends it. It lives in this n8n process: if n8n restarts first, the
+ * user asks again once it is approved.
+ */
+export function followApproval(
+  gateway: VeeforeGateway,
+  pending: PendingCall,
+  perform: () => Promise<unknown>,
+  options: {
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+    log?: (message: string, meta?: Record<string, unknown>) => void;
+  } = {},
+): Promise<FollowOutcome> {
+  const existing = following.get(pending.approvalId);
+  if (existing) return existing;
+  const wait = options.sleep ?? sleep;
+  const now = options.now ?? Date.now;
+  const log = options.log ?? (() => undefined);
+  const started = now();
+  const run = (async (): Promise<FollowOutcome> => {
+    try {
+      for (;;) {
+        await wait(followInterval(now() - started));
+        let status: string;
+        try {
+          status = await waitForApproval(gateway, pending.approvalId, wait, now, 0);
+        } catch (error) {
+          // Veefore unreachable for a moment: keep waiting, within the expiry.
+          log('Veefore: could not check the approval yet', { error: (error as Error).message });
+          const expires = pending.expiresAt ? new Date(pending.expiresAt).getTime() : NaN;
+          if (Number.isFinite(expires) && now() > expires + 60_000) return 'expired';
+          continue;
+        }
+        if (status === 'PENDING') continue;
+        if (status === 'DENIED') return 'denied';
+        if (status !== 'APPROVED') return 'expired';
+        const decision = await gateway.execute({
+          ...pending.request,
+          approvalId: pending.approvalId,
+          idempotencyKey: approvalReplayKey(pending.request.idempotencyKey, pending.approvalId),
+        });
+        if (outcomeOf(decision) !== 'allowed') {
+          // Already used (the user asked again and it ran), or policy changed.
+          log('Veefore: the approved action was not run again', {
+            reason: decision.reason ?? null,
+          });
+          return 'refused';
+        }
+        await perform();
+        log('Veefore: performed the approved action', { approvalId: pending.approvalId });
+        return 'performed';
+      }
+    } catch (error) {
+      log(`Veefore: the approved action failed: ${(error as Error).message}`, {
+        error: (error as Error).message,
+        stack: (error as Error).stack,
+      });
+      return 'error';
+    } finally {
+      following.delete(pending.approvalId);
+    }
+  })();
+  following.set(pending.approvalId, run);
+  return run;
+}
+
 /**
  * An AI agent's call to an n8n tool behind Veefore: may it run? Fails closed:
  * no matching Veefore action, an action Veefore performs, or no answer all
@@ -276,6 +367,11 @@ export async function decideN8nCall(
         return {
           approved: false,
           chatInput: GUARD_MESSAGES.pending(label, approval.expires_at),
+          pending: {
+            approvalId: approval.approval_id,
+            expiresAt: approval.expires_at ?? null,
+            request: base,
+          },
           veefore: {
             status: 'approval',
             approval_id: approval.approval_id,
