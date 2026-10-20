@@ -44,25 +44,27 @@ Saving the credential tests it against the gateway.
 - **Check Only**: the decision without running anything.
 - **List Tools** and **Get Approval**.
 
-As **Veefore Tool** on an AI Agent, each parameter is filled by the model with
-its own description, and the result (including "waiting for approval",
-"approved and done" or "refused: reason") comes back to the agent.
+## Veefore Tools (for an AI Agent)
 
-## Veefore Guard
+Connect **Veefore Tools** to an AI Agent's Tool input and pick the agent's
+actions under **Actions**, as many as you like. Each is offered to the model
+as a tool, and Veefore decides every call.
 
-**Veefore Guard** puts Veefore in front of the n8n tools an AI Agent already
-uses (Gmail, Slack, HTTP Request, …). Connect the tools to the Guard and the
-Guard to the AI Agent, with no tool on the agent directly. When the model calls
-a tool, the tool runs only if Veefore allows that exact call. In Veefore, give
-the agent the matching catalog action with **n8n performs it**.
+- **Veefore performs it**: the gateway carries it out.
+- **n8n performs it**: picking one shows an **n8n Tools** input. Connect the n8n
+  tool that performs it (Gmail, Slack, HTTP Request, …) there instead of to the
+  agent. The model sees it by its own name, and it runs only after Veefore
+  allows that exact call. Tools wired in for anything else are not offered.
 
-- Allowed: the tool runs once. Refused: it does not run, and the model is told why.
-- Needs approval: the Guard waits up to **Wait for a Decision** (2 minutes by
-  default). Still undecided: the tool does not run and the model tells the user
-  to ask again once approved; the identical call then goes ahead without a
-  second approval.
-- Fails closed: no matching action, an action Veefore performs, or no answer
-  from Veefore means the tool does not run.
+Allowed: it runs once. Refused: nothing runs, and the model is told why. Needs
+approval: the node waits up to **Wait for a Decision** (2 minutes by default).
+Still undecided: an action Veefore performs is carried out by Veefore if it is
+approved later; for one n8n performs, the user asks again once approved and the
+identical call goes ahead without a second approval. No answer from Veefore
+means nothing runs.
+
+**Veefore Tool** (one action per node) and **Veefore Guard** keep working in
+existing workflows but are no longer offered for new nodes.
 
 ## Important
 

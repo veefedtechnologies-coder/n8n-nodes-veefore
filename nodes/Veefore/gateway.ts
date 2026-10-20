@@ -3,6 +3,7 @@ import {
   type IDataObject,
   type IExecuteFunctions,
   type ILoadOptionsFunctions,
+  type ISupplyDataFunctions,
 } from 'n8n-workflow';
 import { VeeforeGateway, credentialsFromData, type HttpFn } from '../../lib/veefore';
 
@@ -26,7 +27,7 @@ export function httpFrom(helpers: Http): HttpFn {
 }
 
 export async function gatewayFor(
-  context: IExecuteFunctions | ILoadOptionsFunctions,
+  context: IExecuteFunctions | ILoadOptionsFunctions | ISupplyDataFunctions,
 ): Promise<VeeforeGateway> {
   const data = (await context.getCredentials('veeforeApi')) as IDataObject;
   return new VeeforeGateway(credentialsFromData(data), httpFrom(context.helpers), sleep);

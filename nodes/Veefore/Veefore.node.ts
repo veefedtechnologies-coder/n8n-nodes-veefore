@@ -22,6 +22,7 @@ import {
   waitForApproval,
   type Outcome,
 } from '../../lib/veefore';
+import { handedOverMessage, notHandedOverMessage, summarize } from './calls';
 import { gatewayFor } from './gateway';
 import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schema';
 
@@ -45,60 +46,6 @@ import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schem
 
 const OUTPUT_INDEX: Record<Outcome, number> = { allowed: 0, refused: 1, approval: 2 };
 
-/** What an AI agent, or a person reading the output, should take from a decision. */
-function messageFor(outcome: Outcome, decision: Record<string, unknown>, status?: string): string {
-  const reason = String(decision.reason ?? '')
-    .trim()
-    .replace(/\.+$/, '');
-  if (outcome === 'allowed') {
-    const result = decision.result as { client_executed?: unknown } | null | undefined;
-    // "Veefore decides, n8n performs": nothing has happened yet.
-    if (result && typeof result === 'object' && result.client_executed === true)
-      return 'Veefore allowed this. It is not done yet: the node on the Allowed output performs it.';
-    return 'Done. Veefore allowed this and it was carried out.';
-  }
-  if (outcome === 'approval')
-    return 'Waiting for a person to approve this in Veefore. Nothing has been done yet.';
-  if (status === 'DENIED') return `A person denied this in Veefore. Nothing was done.`;
-  if (status === 'EXPIRED') return 'No one approved this in time. Nothing was done.';
-  if (decision.outcome === 'FAILED')
-    return `Veefore allowed this, but the tool did not complete${reason ? `: ${reason}` : ''}. Do not assume it happened.`;
-  return `Veefore refused this${reason ? `: ${reason}` : ''}. Nothing was done.`;
-}
-
-function summarize(
-  outcome: Outcome,
-  decision: Record<string, unknown>,
-  approvalStatus?: string,
-): IDataObject {
-  const approval = (decision.approval ?? null) as IDataObject | null;
-  return {
-    status: outcome,
-    message: messageFor(outcome, decision, approvalStatus),
-    performed_by:
-      outcome !== 'allowed'
-        ? null
-        : (decision.result as { client_executed?: unknown } | null)?.client_executed === true
-          ? 'n8n'
-          : 'veefore',
-    decision: (decision.decision ?? decision.result ?? null) as string | null,
-    outcome: (decision.outcome ?? null) as string | null,
-    reason: (decision.reason ?? null) as string | null,
-    action_id: (decision.action_id ?? null) as string | null,
-    approval_id: (approval?.approval_id as string | undefined) ?? null,
-    approval_status: approvalStatus ?? (approval?.status as string | undefined) ?? null,
-    result: (decision.result && typeof decision.result === 'object'
-      ? decision.result
-      : null) as IDataObject | null,
-    ...(decision.authorization_id
-      ? {
-          authorization_id: decision.authorization_id as string,
-          expires_at: decision.expires_at as string,
-        }
-      : {}),
-  };
-}
-
 export class Veefore implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Veefore',
@@ -113,7 +60,9 @@ export class Veefore implements INodeType {
     inputs: [NodeConnectionTypes.Main],
     outputs: [NodeConnectionTypes.Main, NodeConnectionTypes.Main, NodeConnectionTypes.Main],
     outputNames: ['Allowed', 'Refused', 'Needs Approval'],
-    usableAsTool: true,
+    // "Veefore Tool" (one action per node) keeps working in existing
+    // workflows, but new agents use Veefore Tools, so it is not offered.
+    usableAsTool: { replacements: { hidden: true } },
     credentials: [{ name: 'veeforeApi', required: true }],
     properties: [
       {
@@ -477,28 +426,6 @@ export class Veefore implements INodeType {
     }
     return asTool ? [outputs[0]!] : outputs;
   }
-}
-
-/** When the approval runs out, in words. */
-function untilText(expiresAt: string | undefined): string {
-  if (!expiresAt) return 'before the approval expires';
-  const minutes = Math.max(1, Math.round((new Date(expiresAt).getTime() - Date.now()) / 60_000));
-  const when = new Date(expiresAt).toISOString().replace('T', ' ').slice(0, 16);
-  if (minutes >= 120) {
-    const hours = Math.round(minutes / 60);
-    return `within about ${hours} hours (by ${when} UTC)`;
-  }
-  return `within about ${minutes} minute${minutes === 1 ? '' : 's'} (by ${when} UTC)`;
-}
-
-/** What the chat should say once Veefore has taken it over. */
-function handedOverMessage(expiresAt: string | undefined): string {
-  return `Not done yet: a person must approve this in Veefore first. Veefore will carry it out automatically if they approve it ${untilText(expiresAt)}; nothing more is needed from you or the user. If they deny it or no one decides in time, it will not happen. Tell the user exactly this, and do not call this tool again for the same request.`;
-}
-
-/** The action cannot be done later by Veefore (n8n performs it, or the hand-over failed). */
-function notHandedOverMessage(expiresAt: string | undefined, why: string): string {
-  return `Not done yet: a person must approve this in Veefore first, and it will not happen on its own (${why.replace(/\.$/, '')}). Tell the user it is waiting for approval, and that once it is approved ${untilText(expiresAt)} they should ask again; then call this tool again with the same request.`;
 }
 
 function checkMessage(outcome: Outcome, decision: Record<string, unknown>): string {
