@@ -36,7 +36,14 @@ import {
   type RawAction,
 } from '../../lib/agent-tools';
 import { GUARD_MESSAGES } from '../../lib/guard';
-import { decideN8nCall, followApproval, originOf, runVeeforeCall } from '../Veefore/calls';
+import {
+  canFollow,
+  decideN8nCall,
+  followApproval,
+  originOf,
+  reportClientResult,
+  runVeeforeCall,
+} from '../Veefore/calls';
 import { gatewayFor } from '../Veefore/gateway';
 import { fieldsFromSchema, type JsonSchema } from '../Veefore/schema';
 
@@ -197,7 +204,11 @@ async function callTool(
   });
   if (!answer.approved) {
     let message = answer.chatInput ?? 'Veefore did not allow this. It was NOT done.';
-    if (answer.pending && sendWhenApprovedOf(context, itemIndex)) {
+    if (
+      answer.pending &&
+      sendWhenApprovedOf(context, itemIndex) &&
+      canFollow(answer.pending.approvalId)
+    ) {
       // The agent answers now; the call is made once a person approves it.
       // By then the run has ended and released n8n's expression engine, which
       // the tool needs to read its $fromAI fields: hold it again for the call.
@@ -222,7 +233,28 @@ async function callTool(
       veefore: answer.veefore as IDataObject,
     };
   }
-  const result = await entry.connected.invoke(args);
+  const actionId = typeof answer.veefore.action_id === 'string' ? answer.veefore.action_id : null;
+  const log = (text: string, meta?: Record<string, unknown>) =>
+    context.logger?.warn(`${text} (${node.name}: ${label})`, meta);
+  let result: unknown;
+  try {
+    result = await entry.connected.invoke(args);
+  } catch (error) {
+    // Allowed, but n8n could not do it: Veefore records the failure.
+    await reportClientResult(
+      prepared.gateway,
+      actionId,
+      'FAILED',
+      (error as Error).message ?? 'The n8n tool failed.',
+      log,
+    );
+    return {
+      status: 'failed',
+      message: `Veefore allowed "${label}", but the n8n tool failed: ${(error as Error).message ?? 'unknown error'}. It was NOT done. Tell the user it failed.`,
+      veefore: answer.veefore as IDataObject,
+    };
+  }
+  await reportClientResult(prepared.gateway, actionId, 'SUCCEEDED', null, log);
   return { response: parsed(result) as IDataObject, veefore: answer.veefore as IDataObject };
 }
 

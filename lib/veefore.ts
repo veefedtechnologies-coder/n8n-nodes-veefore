@@ -449,6 +449,25 @@ export class VeeforeGateway {
   }
 
   /**
+   * Reports what happened to an action n8n performed after Veefore allowed
+   * it, so Veefore's Actions shows a failure instead of "allowed". Reported
+   * once; repeating the same report is harmless.
+   */
+  async reportResult(
+    actionId: string,
+    result: { status: 'SUCCEEDED' | 'FAILED'; error?: string | null },
+  ): Promise<Record<string, unknown>> {
+    return withRetries(async () => {
+      const response = await this.call(
+        'POST',
+        `/gateway/v1/actions/${encodeURIComponent(actionId)}/result`,
+        { status: result.status, error: result.error ?? null },
+      );
+      return unwrap(response) as Record<string, unknown>;
+    }, this.sleep);
+  }
+
+  /**
    * The agent's tools. `maxAgeMs` reuses a recent answer for the same key:
    * the editor asks for the list for every dropdown and parameter list, and a
    * fresh round trip each time made them slow to open. Runs always ask fresh.

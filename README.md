@@ -68,8 +68,13 @@ n8n tool for the ones n8n performs (while n8n keeps running; after a restart,
 the user asks again and the identical call goes ahead without a second
 approval). No answer from Veefore means nothing runs.
 
-2.3.0 removed **Veefore Tool** (one action per node) and **Veefore Guard**:
-replace either with Veefore Tools and add the same action.
+After n8n runs a tool Veefore allowed, the node reports the result, so a
+failed send shows as **Failed** in Veefore's Actions. Before an approved
+request runs, Veefore checks the n8n tool is still in the workflow.
+
+**Breaking in 3.0.0:** **Veefore Tool** (one action per node) and **Veefore
+Guard** were removed (first shipped in 2.3.0). Replace either with Veefore
+Tools and add the same action.
 
 ## Important
 

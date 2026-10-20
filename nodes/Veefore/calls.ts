@@ -201,10 +201,47 @@ export interface PendingCall {
   request: ActionInput;
 }
 
-export type FollowOutcome = 'performed' | 'denied' | 'expired' | 'refused' | 'error';
+export type FollowOutcome = 'performed' | 'failed' | 'denied' | 'expired' | 'refused' | 'error';
 
 /** Approvals being followed in this n8n process: one follower each. */
 const following = new Map<string, Promise<FollowOutcome>>();
+
+/**
+ * At most this many approvals are followed at once in one n8n process. Each
+ * follower keeps its run's tools in memory until the approval is decided
+ * (up to 24 hours), so the number is bounded; beyond it the user asks again.
+ */
+export const MAX_FOLLOWERS = 200;
+
+/** Whether this approval is (or can be) followed now. */
+export function canFollow(approvalId: string): boolean {
+  return following.has(approvalId) || following.size < MAX_FOLLOWERS;
+}
+
+/**
+ * Tells Veefore what happened to an action n8n performed. Never throws: an
+ * older gateway without the endpoint, or a moment without network, must not
+ * turn a done action into an error. Logged instead.
+ */
+export async function reportClientResult(
+  gateway: VeeforeGateway,
+  actionId: string | null,
+  status: 'SUCCEEDED' | 'FAILED',
+  error: string | null,
+  log: (message: string, meta?: Record<string, unknown>) => void = () => undefined,
+): Promise<boolean> {
+  if (!actionId) return false;
+  try {
+    await gateway.reportResult(actionId, { status, error });
+    return true;
+  } catch (failure) {
+    log(`Veefore: could not record the result of ${actionId}: ${(failure as Error).message}`, {
+      actionId,
+      status,
+    });
+    return false;
+  }
+}
 
 /** How often a follower asks: every 10 s for 10 minutes, then every minute. */
 export function followInterval(elapsedMs: number): number {
@@ -260,13 +297,24 @@ export function followApproval(
           idempotencyKey: approvalReplayKey(pending.request.idempotencyKey, pending.approvalId),
         });
         if (outcomeOf(decision) !== 'allowed') {
-          // Already used (the user asked again and it ran), or policy changed.
-          log('Veefore: the approved action was not run again', {
+          // Already used (the user asked again and it ran), the n8n step is
+          // gone, or policy changed: Veefore refused it.
+          log(`Veefore: the approved action was not run: ${String(decision.reason ?? 'refused')}`, {
             reason: decision.reason ?? null,
           });
           return 'refused';
         }
-        await perform();
+        // Claimed: from here on Veefore records whether n8n really did it.
+        const actionId = typeof decision.action_id === 'string' ? decision.action_id : null;
+        try {
+          await perform();
+        } catch (error) {
+          const message = (error as Error).message ?? 'The n8n tool failed.';
+          log(`Veefore: the approved action failed in n8n: ${message}`, { error: message });
+          await reportClientResult(gateway, actionId, 'FAILED', message, log);
+          return 'failed';
+        }
+        await reportClientResult(gateway, actionId, 'SUCCEEDED', null, log);
         log('Veefore: performed the approved action', { approvalId: pending.approvalId });
         return 'performed';
       }
