@@ -34,7 +34,6 @@
     ],
     "nodes": [
       "dist/nodes/Veefore/Veefore.node.js",
-      "dist/nodes/VeeforeGuard/VeeforeGuardHitlTool.node.js",
       "dist/nodes/VeeforeTools/VeeforeTools.node.js"
     ]
   },

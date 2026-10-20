@@ -279,6 +279,11 @@ interface CachedToken {
 
 /** Session tokens per agent and gateway, reused until a minute before expiry. */
 const tokenCache = new Map<string, CachedToken>();
+const toolsCache = new Map<string, { at: number; tools: Array<Record<string, unknown>> }>();
+const toolsInFlight = new Map<string, Promise<Array<Record<string, unknown>>>>();
+
+/** How long the editor reuses the agent's tool list. */
+export const EDITOR_TOOLS_MAX_AGE_MS = 60_000;
 
 export class VeeforeGateway {
   private readonly base: string;
@@ -443,9 +448,32 @@ export class VeeforeGateway {
     }, this.sleep);
   }
 
-  async tools(): Promise<Array<Record<string, unknown>>> {
-    const response = await this.call('GET', '/gateway/v1/tools');
-    return unwrap(response) as Array<Record<string, unknown>>;
+  /**
+   * The agent's tools. `maxAgeMs` reuses a recent answer for the same key:
+   * the editor asks for the list for every dropdown and parameter list, and a
+   * fresh round trip each time made them slow to open. Runs always ask fresh.
+   */
+  async tools(options: { maxAgeMs?: number } = {}): Promise<Array<Record<string, unknown>>> {
+    const key = this.cacheKey();
+    const cached = toolsCache.get(key);
+    if (options.maxAgeMs && cached && Date.now() - cached.at < options.maxAgeMs) {
+      return cached.tools;
+    }
+    // Concurrent dropdowns share one request.
+    const inFlight = options.maxAgeMs ? toolsInFlight.get(key) : undefined;
+    if (inFlight) return inFlight;
+    const pending = (async () => {
+      const response = await this.call('GET', '/gateway/v1/tools');
+      return unwrap(response) as Array<Record<string, unknown>>;
+    })();
+    if (options.maxAgeMs) toolsInFlight.set(key, pending);
+    try {
+      const tools = await pending;
+      toolsCache.set(key, { at: Date.now(), tools });
+      return tools;
+    } finally {
+      if (toolsInFlight.get(key) === pending) toolsInFlight.delete(key);
+    }
   }
 }
 

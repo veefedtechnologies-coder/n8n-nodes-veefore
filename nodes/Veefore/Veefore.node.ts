@@ -14,7 +14,7 @@ import {
   type ResourceMapperValue,
 } from 'n8n-workflow';
 import {
-  TOOL_APPROVAL_WAIT_MS,
+  EDITOR_TOOLS_MAX_AGE_MS,
   VeeforeGatewayError,
   approvalReplayKey,
   itemIdempotencyKey,
@@ -22,7 +22,7 @@ import {
   waitForApproval,
   type Outcome,
 } from '../../lib/veefore';
-import { handedOverMessage, notHandedOverMessage, summarize } from './calls';
+import { summarize } from './calls';
 import { gatewayFor } from './gateway';
 import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schema';
 
@@ -40,12 +40,15 @@ import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schem
  * and then runs the approved action, or routes the item to Needs Approval if
  * the workflow should carry on instead.
  *
- * As a tool for an AI Agent the same node returns one result the model can
- * read, and fills each tool parameter from the model.
+ * For an AI Agent, use Veefore Tools: this node is for workflow steps.
  */
 
 const OUTPUT_INDEX: Record<Outcome, number> = { allowed: 0, refused: 1, approval: 2 };
 
+// Not usable as a tool: Veefore Tools is the AI Agent's node. The rule is
+// @n8n/community-nodes/node-usable-as-tool; it is not named here because the
+// monorepo's ESLint does not load that plugin.
+// eslint-disable-next-line
 export class Veefore implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'Veefore',
@@ -60,9 +63,6 @@ export class Veefore implements INodeType {
     inputs: [NodeConnectionTypes.Main],
     outputs: [NodeConnectionTypes.Main, NodeConnectionTypes.Main, NodeConnectionTypes.Main],
     outputNames: ['Allowed', 'Refused', 'Needs Approval'],
-    // "Veefore Tool" (one action per node) keeps working in existing
-    // workflows, but new agents use Veefore Tools, so it is not offered.
-    usableAsTool: { replacements: { hidden: true } },
     credentials: [{ name: 'veeforeApi', required: true }],
     properties: [
       {
@@ -167,15 +167,7 @@ export class Veefore implements INodeType {
         default: 'wait',
         description:
           'Whether approval is needed is decided by your Veefore policy, not here. This only says what the workflow does meanwhile.',
-        displayOptions: { show: { operation: ['execute'], '@tool': [false] } },
-      },
-      {
-        displayName:
-          'The model fills in each parameter. Veefore decides whether it runs, and waits for a person when your policy asks for approval.',
-        name: 'toolNotice',
-        type: 'notice',
-        default: '',
-        displayOptions: { show: { '@tool': [true] } },
+        displayOptions: { show: { operation: ['execute'] } },
       },
       {
         displayName: 'Approval ID',
@@ -210,7 +202,7 @@ export class Veefore implements INodeType {
     loadOptions: {
       async getTools(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
         const gateway = await gatewayFor(this);
-        const tools = await gateway.tools();
+        const tools = await gateway.tools({ maxAgeMs: EDITOR_TOOLS_MAX_AGE_MS });
         return tools.map((tool) => ({
           name: String(tool.name ?? tool.key),
           value: String(tool.key),
@@ -223,17 +215,18 @@ export class Veefore implements INodeType {
         const toolKey = String(this.getCurrentNodeParameter('tool') ?? '');
         if (!toolKey) return { fields: [], emptyFieldsNotice: 'Choose a tool first.' };
         const gateway = await gatewayFor(this);
-        const tool = (await gateway.tools()).find((entry) => entry.key === toolKey);
+        const tool = (await gateway.tools({ maxAgeMs: EDITOR_TOOLS_MAX_AGE_MS })).find(
+          (entry) => entry.key === toolKey,
+        );
         if (!tool) {
           return {
             fields: [],
             emptyFieldsNotice: 'This agent may not use that tool. Check its access in Veefore.',
           };
         }
-        const asTool = this.getNode().type.endsWith('Tool');
         const fields: ResourceMapperField[] = fieldsFromSchema(
           (tool.parameter_schema ?? {}) as JsonSchema,
-          { fromAi: asTool },
+          { fromAi: false },
         );
         return { fields };
       },
@@ -245,7 +238,6 @@ export class Veefore implements INodeType {
     const gateway = await gatewayFor(this);
     const workflow = this.getWorkflow();
     const node = this.getNode();
-    const asTool = node.type.endsWith('Tool');
     let instance: string | null = null;
     try {
       instance = this.getInstanceBaseUrl();
@@ -278,8 +270,7 @@ export class Veefore implements INodeType {
 
     const outputs: INodeExecutionData[][] = [[], [], []];
     const emit = (outcome: Outcome, json: IDataObject, itemIndex: number) => {
-      // An AI agent reads only the first output; it gets every outcome there.
-      outputs[asTool ? 0 : OUTPUT_INDEX[outcome]]!.push({ json, pairedItem: { item: itemIndex } });
+      outputs[OUTPUT_INDEX[outcome]]!.push({ json, pairedItem: { item: itemIndex } });
     };
 
     for (let itemIndex = 0; itemIndex < Math.max(items.length, 1); itemIndex += 1) {
@@ -362,39 +353,10 @@ export class Veefore implements INodeType {
           | { approval_id?: string; expires_at?: string }
           | null
           | undefined;
-        const onApproval = asTool
-          ? 'wait'
-          : (this.getNodeParameter('onApproval', itemIndex, 'wait') as string);
+        const onApproval = this.getNodeParameter('onApproval', itemIndex, 'wait') as string;
         if (outcome === 'approval' && approval?.approval_id && onApproval === 'wait') {
-          // An AI agent answers its chat after a short wait; a workflow waits
-          // for as long as the approval is open.
-          approvalStatus = await waitForApproval(
-            gateway,
-            approval.approval_id,
-            sleep,
-            Date.now,
-            asTool ? TOOL_APPROVAL_WAIT_MS : undefined,
-          );
-          if (approvalStatus === 'PENDING') {
-            // Still undecided: Veefore carries it out if it is approved later.
-            const handover = await gateway
-              .handOver(approval.approval_id, base)
-              .then((answer) => ({ ok: true as const, answer }))
-              .catch((error: Error) => ({ ok: false as const, error }));
-            emit(
-              'approval',
-              {
-                ...summarize('approval', decision, 'PENDING'),
-                message: handover.ok
-                  ? handedOverMessage(approval.expires_at)
-                  : notHandedOverMessage(approval.expires_at, handover.error.message),
-                handed_over: handover.ok,
-                expires_at: approval.expires_at ?? null,
-              },
-              itemIndex,
-            );
-            continue;
-          }
+          // A workflow waits for as long as the approval is open.
+          approvalStatus = await waitForApproval(gateway, approval.approval_id, sleep, Date.now);
           if (approvalStatus === 'APPROVED') {
             decision = await gateway.execute({
               ...base,
@@ -409,7 +371,7 @@ export class Veefore implements INodeType {
         emit(outcome, summarize(outcome, decision, approvalStatus), itemIndex);
       } catch (error) {
         if (this.continueOnFail()) {
-          outputs[asTool ? 0 : 1]!.push({
+          outputs[1]!.push({
             json: { status: 'error', message: (error as Error).message },
             pairedItem: { item: itemIndex },
           });
@@ -424,7 +386,7 @@ export class Veefore implements INodeType {
         throw new NodeOperationError(node, error as Error, { itemIndex });
       }
     }
-    return asTool ? [outputs[0]!] : outputs;
+    return outputs;
   }
 }
 

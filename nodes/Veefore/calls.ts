@@ -209,6 +209,8 @@ export async function decideN8nCall(
     /** Names the call within the execution (the tool call id). */
     callKey: string;
     itemIndex: number;
+    /** Why the agent takes this action, shown to approvers. */
+    purpose?: string;
   },
 ): Promise<GuardAnswer> {
   const { target, origin } = input;
@@ -241,14 +243,20 @@ export async function decideN8nCall(
       tool: tool.key,
       parameters,
     });
+    const purpose = [
+      input.purpose,
+      unresolved.length > 0
+        ? `n8n fills ${unresolved.join(', ')} from an expression at run time.`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
     const base: ActionInput = {
       tool: tool.key,
       parameters,
       idempotencyKey,
       runtime,
-      ...(unresolved.length > 0
-        ? { purpose: `n8n fills ${unresolved.join(', ')} from an expression at run time.` }
-        : {}),
+      ...(purpose ? { purpose } : {}),
     };
     let decision = await gateway.execute(base);
     let outcome = outcomeOf(decision);

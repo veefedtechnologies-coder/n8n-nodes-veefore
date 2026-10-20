@@ -46,15 +46,19 @@ Saving the credential tests it against the gateway.
 
 ## Veefore Tools (for an AI Agent)
 
-Connect **Veefore Tools** to an AI Agent's Tool input and pick the agent's
-actions under **Actions**, as many as you like. Each is offered to the model
-as a tool, and Veefore decides every call.
+Connect **Veefore Tools** to an AI Agent's Tool input and **Add Action** for
+each of the agent's actions, as many as you like. Each is offered to the model
+as a tool, and Veefore decides every call. Every action has its own **Tool
+Name**, **Tool Description** and **Purpose** (shown to approvers).
 
-- **Veefore performs it**: the gateway carries it out.
-- **n8n performs it**: picking one shows an **n8n Tools** input. Connect the n8n
+- **Veefore performs it**: the gateway carries it out. Its **Parameters** come
+  from Veefore, required ones first; each is filled by the model (with a hint
+  you can edit) or set to a fixed value the model never sees.
+- **n8n performs it**: adding one shows an **n8n Tools** input. Connect the n8n
   tool that performs it (Gmail, Slack, HTTP Request, …) there instead of to the
-  agent. The model sees it by its own name, and it runs only after Veefore
-  allows that exact call. Tools wired in for anything else are not offered.
+  agent, and set its fields in that tool. The model sees it by its own name,
+  and it runs only after Veefore allows that exact call. Tools wired in for
+  anything else are not offered.
 
 Allowed: it runs once. Refused: nothing runs, and the model is told why. Needs
 approval: the node waits up to **Wait for a Decision** (2 minutes by default).
@@ -63,8 +67,8 @@ approved later; for one n8n performs, the user asks again once approved and the
 identical call goes ahead without a second approval. No answer from Veefore
 means nothing runs.
 
-**Veefore Tool** (one action per node) and **Veefore Guard** keep working in
-existing workflows but are no longer offered for new nodes.
+2.3.0 removed **Veefore Tool** (one action per node) and **Veefore Guard**:
+replace either with Veefore Tools and add the same action.
 
 ## Important
 
