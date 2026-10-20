@@ -15,16 +15,14 @@ import {
 } from 'n8n-workflow';
 import {
   TOOL_APPROVAL_WAIT_MS,
-  VeeforeGateway,
   VeeforeGatewayError,
   approvalReplayKey,
-  credentialsFromData,
   itemIdempotencyKey,
   outcomeOf,
   waitForApproval,
-  type HttpFn,
   type Outcome,
 } from '../../lib/veefore';
+import { gatewayFor } from './gateway';
 import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schema';
 
 /**
@@ -44,30 +42,6 @@ import { fieldsFromSchema, parametersFromMapper, type JsonSchema } from './schem
  * As a tool for an AI Agent the same node returns one result the model can
  * read, and fills each tool parameter from the model.
  */
-
-type Http = IExecuteFunctions['helpers'] | ILoadOptionsFunctions['helpers'];
-
-/** n8n's httpRequest helper, which honours the instance's proxy settings. */
-function httpFrom(helpers: Http): HttpFn {
-  return async (request) => {
-    const response = (await helpers.httpRequest({
-      method: request.method,
-      url: request.url,
-      headers: request.headers,
-      body: request.body as IDataObject | undefined,
-      json: true,
-      timeout: request.timeoutMs,
-      returnFullResponse: true,
-      ignoreHttpStatusErrors: true,
-    })) as { statusCode: number; headers: Record<string, string>; body: unknown };
-    return { status: response.statusCode, headers: response.headers, body: response.body };
-  };
-}
-
-async function gatewayFor(context: IExecuteFunctions | ILoadOptionsFunctions) {
-  const data = (await context.getCredentials('veeforeApi')) as IDataObject;
-  return new VeeforeGateway(credentialsFromData(data), httpFrom(context.helpers), sleep);
-}
 
 const OUTPUT_INDEX: Record<Outcome, number> = { allowed: 0, refused: 1, approval: 2 };
 

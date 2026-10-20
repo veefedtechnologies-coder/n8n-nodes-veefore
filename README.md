@@ -48,6 +48,22 @@ As **Veefore Tool** on an AI Agent, each parameter is filled by the model with
 its own description, and the result (including "waiting for approval",
 "approved and done" or "refused: reason") comes back to the agent.
 
+## Veefore Guard
+
+**Veefore Guard** puts Veefore in front of the n8n tools an AI Agent already
+uses (Gmail, Slack, HTTP Request, …). Connect the tools to the Guard and the
+Guard to the AI Agent, with no tool on the agent directly. When the model calls
+a tool, the tool runs only if Veefore allows that exact call. In Veefore, give
+the agent the matching catalog action with **n8n performs it**.
+
+- Allowed: the tool runs once. Refused: it does not run, and the model is told why.
+- Needs approval: the Guard waits up to **Wait for a Decision** (2 minutes by
+  default). Still undecided: the tool does not run and the model tells the user
+  to ask again once approved; the identical call then goes ahead without a
+  second approval.
+- Fails closed: no matching action, an action Veefore performs, or no answer
+  from Veefore means the tool does not run.
+
 ## Important
 
 Installing this node does not protect a workflow that also contains a direct

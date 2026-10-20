@@ -33,7 +33,8 @@
       "dist/credentials/VeeforeApi.credentials.js"
     ],
     "nodes": [
-      "dist/nodes/Veefore/Veefore.node.js"
+      "dist/nodes/Veefore/Veefore.node.js",
+      "dist/nodes/VeeforeGuard/VeeforeGuardHitlTool.node.js"
     ]
   },
   "peerDependencies": {
