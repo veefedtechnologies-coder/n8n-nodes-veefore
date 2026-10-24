@@ -29,8 +29,11 @@ export interface GuardedNode {
 export interface VeeforeToolEntry {
   key: string;
   name?: string;
+  description?: string;
   kind?: string;
   parameter_schema?: Record<string, unknown> | null;
+  /** The app it belongs to (gateways from 3.4 on): "WhatsApp Business Cloud", "Send message". */
+  app?: { id: string; name: string; action?: string | null } | null;
 }
 
 /** The n8n catalog action a tool node performs: `n8n-nodes-base.gmail:message.send`. */

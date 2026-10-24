@@ -16,7 +16,13 @@
  * them, with no n8n imports, so it is tested on its own.
  */
 import { actionOf, matchTool, toolNameOf, type GuardedNode, type VeeforeToolEntry } from './guard';
-import { parametersFromMapper, type JsonSchema } from '../nodes/Veefore/schema';
+import type { ResourceMapperField } from 'n8n-workflow';
+import {
+  fieldsFromSchema,
+  fromAiExpression,
+  parametersFromMapper,
+  type JsonSchema,
+} from '../nodes/Veefore/schema';
 
 /** Picked actions are stored with their kind, so the editor can show the n8n Tools input. */
 export const N8N_PERFORMS = '::n8n';
@@ -34,10 +40,22 @@ export function keyOf(value: unknown): string {
 }
 
 /** The expression n8n evaluates in the editor to show the n8n Tools input. */
-export const INPUTS_EXPRESSION = `={{ ((list) => (Array.isArray(list) && list.some((a) => String((a && a.tool) || '').endsWith('${N8N_PERFORMS}'))) ? [{ type: 'ai_tool', displayName: 'n8n Tools' }] : [])($parameter.actions ? $parameter.actions.action : [{ tool: $parameter.tool }]) }}`;
+export const INPUTS_EXPRESSION = `={{ ((list) => (Array.isArray(list) && list.some((a) => ((t) => t.endsWith('::n8n') || t.endsWith('::mixed'))(String((a && a.tool) || '')))) ? [{ type: 'ai_tool', displayName: 'n8n Tools' }] : [])($parameter.app ? [{ tool: $parameter.app }] : $parameter.actions ? $parameter.actions.action : [{ tool: $parameter.tool }]) }}`;
+
+/**
+ * Version 3's check, made by the editor as it shows the app's settings:
+ * `stale` when the Fields hold another app's list (the app was changed). The
+ * Actions and Fields then hide, so n8n clears them, and show again, loading
+ * the new app's. Anything that fails to resolve keeps them shown.
+ *
+ * It must not name the node's later settings (`app` + `Fields` is built, not
+ * written): the editor resolves an expression that names one only after it,
+ * with its values, and a ✨ value among them fails the whole check.
+ */
+export const APP_CHECK_EXPRESSION = `={{ ((list, picked) => { const schema = list && Array.isArray(list.schema) ? list.schema : []; const id = String(picked || '').replace(/::(?:n8n|veefore|mixed)$/, '').toLowerCase().replace(/[^a-z0-9]/g, '') || 'app'; return schema.every((field) => String((field && field.id) || '').startsWith(id + '__')) ? 'ok' : 'stale'; })($parameter['app' + 'Fields'], $parameter.app) }}`;
 
 /** Version 1: how many actions; version 2: which one. */
-export const SUBTITLE_EXPRESSION = `={{ $parameter.actions ? (($parameter.actions.action || []).length + " action(s)") : String($parameter.tool || "").replace(/::(?:n8n|veefore)$/, "").replace(/_/g, " ") }}`;
+export const SUBTITLE_EXPRESSION = `={{ $parameter.app ? String($parameter.app).replace(/::(?:n8n|veefore|mixed)$/, "") : $parameter.actions ? (($parameter.actions.action || []).length + " action(s)") : String($parameter.tool || "").replace(/::(?:n8n|veefore)$/, "").replace(/_/g, " ") }}`;
 
 export function needsN8nTools(items: unknown): boolean {
   return (
@@ -66,6 +84,8 @@ export interface ActionConfig {
   model: Record<string, string> | null;
   /** Purpose left to the model: the hint it is given. It sends it with each call. */
   purposeFromModel?: string;
+  /** Added to the tool's description: how to use this app's actions. */
+  instructions?: string;
 }
 
 /** The argument a model fills with its purpose, when Purpose is left to it. */
@@ -123,10 +143,18 @@ export function readAction(
   raw: RawAction,
   schema: JsonSchema | undefined,
   evaluate: (name: string) => unknown,
+  options: {
+    /**
+     * Fields the mapper does not list (or lists for another action of the
+     * app) are the model's, with Veefore's own description (version 3).
+     */
+    unlistedToModel?: boolean;
+  } = {},
 ): ActionConfig {
-  // Name, description and purpose are set by a person. An expression here is
-  // n8n's own "let the model fill it" override (saved by older versions of
-  // this node): ignored, so the model never names or justifies its own tool.
+  // Name and description are set by a person. An expression here is n8n's
+  // own "let the model fill it" override (saved by older versions of this
+  // node): ignored, so the model never names or describes its own tool. The
+  // purpose's expressions are read below.
   const text = (value: unknown) =>
     typeof value === 'string' && !value.trim().startsWith('=') ? value.trim() : '';
   const key = keyOf(raw.tool);
@@ -146,10 +174,21 @@ export function readAction(
     model: null,
   };
   // Purpose left to the model ("Defined automatically by the model"): the
-  // model says why, per call, and approvers see it.
+  // model says why, per call, and approvers see it. Any other expression is
+  // the person's, evaluated for the run.
   if (typeof raw.purpose === 'string' && raw.purpose.trim().startsWith('=')) {
     const fromAi = FROM_AI.exec(raw.purpose);
-    if (fromAi) config.purposeFromModel = unescape(fromAi[4] ?? '');
+    if (fromAi) {
+      config.purposeFromModel = unescape(fromAi[4] ?? '');
+    } else {
+      let value: unknown;
+      try {
+        value = evaluate('purpose');
+      } catch {
+        // An expression that cannot be resolved here sets no purpose.
+      }
+      if (typeof value === 'string' && value.trim()) config.purpose = value.trim();
+    }
   }
 
   // The field mapper wins: a 3.2.0 Fields list may linger, hidden, next to it.
@@ -196,6 +235,42 @@ export function readAction(
   }
 
   if (!mapper || !mapper.value || typeof mapper.value !== 'object') return config;
+
+  if (options.unlistedToModel) {
+    const properties = schema?.properties ?? {};
+    const model: Record<string, string> = Object.fromEntries(
+      Object.keys(properties).map((name) => [name, '']),
+    );
+    const fixedRaw: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(mapper.value)) {
+      // A field of another of the app's actions.
+      if (!(name in properties)) continue;
+      if (value === undefined || value === null || value === '') continue;
+      if (typeof value === 'string' && value.trim().startsWith('=')) {
+        const fromAi = FROM_AI.exec(value);
+        if (fromAi) {
+          model[name] = unescape(fromAi[4] ?? '');
+          continue;
+        }
+        fixedRaw[name] = evaluate(`parameters.value.${name}`);
+      } else {
+        fixedRaw[name] = value;
+      }
+      delete model[name];
+    }
+    config.fixed = parametersFromMapper(
+      {
+        value: fixedRaw as never,
+        schema: Object.keys(fixedRaw).map((id) => ({
+          id,
+          type: typeOfProperty(properties[id]),
+        })) as never,
+      },
+      schema,
+    );
+    config.model = Object.keys(properties).length > 0 ? model : null;
+    return config;
+  }
 
   const removed = new Set((mapper.schema ?? []).filter((f) => f.removed).map((f) => f.id));
   const model: Record<string, string> = {};
@@ -336,7 +411,17 @@ export function planTools(
   available: VeeforeToolEntry[],
   connected: ConnectedTool[],
   nodes: GuardedNode[],
+  options: {
+    /**
+     * An action n8n performs with no n8n tool wired in is still offered, and
+     * says so when called (versions 1 and 2). Version 3 offers only what can run.
+     */
+    offerMissing?: boolean;
+  } = {},
 ): Plan {
+  const offerMissing = options.offerMissing !== false;
+  const told = (text: string, config: ActionConfig) =>
+    config.instructions ? `${text}\n\n${config.instructions}`.slice(0, 2000) : text;
   const entries: PlanEntry[] = [];
   const hints: string[] = [];
   const used = new Set<ConnectedTool>();
@@ -365,7 +450,7 @@ export function planTools(
       entries.push({
         kind: 'veefore',
         name: unique(safeName(config.name || tool.key)),
-        description,
+        description: told(description, config),
         schema: withPurposeArgument(modelSchema(tool.parameter_schema, config.model), config),
         tool,
         config,
@@ -381,6 +466,7 @@ export function planTools(
       hints.push(
         `"${label}" is performed by n8n, but no matching n8n tool is connected to this node's n8n Tools input.`,
       );
+      if (!offerMissing) continue;
       entries.push({
         kind: 'missing',
         name: unique(safeName(config.name || tool.key)),
@@ -396,7 +482,7 @@ export function planTools(
       entries.push({
         kind: 'n8n',
         name: unique(config.name ? safeName(config.name) : candidate.name),
-        description: config.description || candidate.description || description,
+        description: told(config.description || candidate.description || description, config),
         schema: candidate.schema,
         tool,
         config,
@@ -484,3 +570,267 @@ export const TOOLS_MESSAGES = {
   unknownCall: (name: string) =>
     `There is no tool called "${name}" on this Veefore Tools node, so nothing was done.`,
 };
+
+// ---------------------------------------------------------------------------
+// Version 3: one app per node
+// ---------------------------------------------------------------------------
+
+/** An app as the node offers it: its name, its actions, who performs them. */
+export interface AgentApp {
+  id: string;
+  name: string;
+  performer: 'veefore' | 'n8n' | 'mixed';
+  tools: VeeforeToolEntry[];
+}
+
+/** An app's name as its id: `WhatsApp Business Cloud` → `whatsappbusinesscloud` (as Veefore's). */
+export function appIdOf(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'app';
+}
+
+/** A tool's app: as the gateway lists it, else from its name (`Send message (WhatsApp)`). */
+export function appOfEntry(tool: VeeforeToolEntry): { id: string; name: string; action: string } {
+  const stripped = (tool.name || tool.key).replace(/\s*\([^()]+\)\s*$/, '').trim();
+  if (tool.app?.name) {
+    return {
+      id: tool.app.id || appIdOf(tool.app.name),
+      name: tool.app.name,
+      action: tool.app.action || stripped || tool.key,
+    };
+  }
+  const named = /\(([^()]+)\)\s*$/.exec(tool.name ?? '')?.[1]?.trim();
+  const name = named || tool.name || tool.key;
+  return { id: appIdOf(name), name, action: named ? stripped : tool.name || tool.key };
+}
+
+/** The agent's tools, app by app, in the order Veefore lists them. */
+export function groupApps(tools: VeeforeToolEntry[]): AgentApp[] {
+  const apps = new Map<string, AgentApp>();
+  for (const tool of tools) {
+    const { id, name } = appOfEntry(tool);
+    const app = apps.get(id) ?? { id, name, performer: 'veefore' as const, tools: [] };
+    app.tools.push(tool);
+    apps.set(id, app);
+  }
+  for (const app of apps.values()) {
+    const n8n = app.tools.filter((tool) => tool.kind === 'CLIENT').length;
+    app.performer = n8n === 0 ? 'veefore' : n8n === app.tools.length ? 'n8n' : 'mixed';
+  }
+  return [...apps.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** How a picked app is stored: its name and who performs it, so the editor knows the inputs. */
+export function appValue(app: Pick<AgentApp, 'name' | 'performer'>): string {
+  return `${app.name}::${app.performer}`;
+}
+
+/** The app a stored pick names (its id), and who performed it when picked. */
+export function appOfValue(value: unknown): { id: string; name: string } | null {
+  const text = String(value ?? '').trim();
+  if (!text || text.startsWith('=')) return null;
+  const name = text.replace(/::(?:n8n|veefore|mixed)$/, '');
+  return name ? { id: appIdOf(name), name } : null;
+}
+
+/** The tools of the picked app. */
+export function appTools(tools: VeeforeToolEntry[], value: unknown): VeeforeToolEntry[] {
+  const picked = appOfValue(value);
+  return picked ? tools.filter((tool) => appOfEntry(tool).id === picked.id) : [];
+}
+
+/**
+ * The actions left to the model (n8n's ✨, "Defined automatically by the
+ * model"): it may use every action of the app, as when none are picked.
+ */
+export const AUTO_ACTIONS = fromAiExpression('Actions', '', 'string', true);
+
+/** The purpose's default: the model says why with each call. */
+export const AUTO_PURPOSE = fromAiExpression(
+  'Purpose',
+  'Why you are taking this action, in one sentence. Shown to the person who approves it.',
+  'string',
+  true,
+);
+
+/**
+ * Which of the app's actions the model may use: all of them (✨, or none
+ * chosen), with the hint written under ✨; or the ones chosen.
+ */
+export function actionsChoice(
+  raw: unknown,
+  evaluate: () => unknown = () => undefined,
+): { all: true; hint: string } | { all: false; keys: string[] } {
+  let value = raw;
+  if (typeof value === 'string' && value.trim().startsWith('=')) {
+    const fromAi = FROM_AI.exec(value);
+    if (fromAi) return { all: true, hint: unescape(fromAi[4] ?? '') };
+    value = evaluate();
+  }
+  const keys = (Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [])
+    .map((key) => String(key).trim())
+    .filter(Boolean);
+  return keys.length > 0 ? { all: false, keys } : { all: true, hint: '' };
+}
+
+/**
+ * The picked actions, in the app's order. Picks that are all another app's
+ * (the node's app was changed since) say nothing about this one: all of it.
+ */
+export function chosenTools(
+  tools: VeeforeToolEntry[],
+  choice: ReturnType<typeof actionsChoice>,
+): { tools: VeeforeToolEntry[]; foreign: boolean } {
+  if (choice.all) return { tools, foreign: false };
+  const picked = tools.filter((tool) => choice.keys.includes(tool.key));
+  return picked.length > 0 ? { tools: picked, foreign: false } : { tools, foreign: true };
+}
+
+/**
+ * A Fields id: the app's id, then the field's name. A list loaded for another
+ * app (the node's app was changed since) then never mixes with this one, and
+ * n8n's refresh starts it afresh.
+ */
+export const APP_FIELD_SEPARATOR = '__';
+export function appFieldId(appId: string, name: string): string {
+  return `${appId}${APP_FIELD_SEPARATOR}${name}`;
+}
+
+/** The field a Fields id names, when it is this app's. */
+export function appFieldName(appId: string, id: string): string | null {
+  const prefix = `${appId}${APP_FIELD_SEPARATOR}`;
+  return appId && id.startsWith(prefix) ? id.slice(prefix.length) || null : null;
+}
+
+/** This app's Fields, by field name; another app's are dropped. */
+function scopedFields(mapper: RawAction['parameters'], appId: string): RawAction['parameters'] {
+  if (!mapper || !mapper.value || typeof mapper.value !== 'object') return mapper;
+  const value: Record<string, unknown> = {};
+  for (const [id, entry] of Object.entries(mapper.value)) {
+    const name = appFieldName(appId, id);
+    if (name !== null) value[name] = entry;
+  }
+  const schema = (mapper.schema ?? []).flatMap((field) => {
+    const name = appFieldName(appId, field.id);
+    return name === null ? [] : [{ ...field, id: name }];
+  });
+  return { ...mapper, value, schema };
+}
+
+/** `WhatsApp Business Cloud` → `whatsapp_business_cloud`: a tool name's lead. */
+export function appSlug(name: string): string {
+  let slug = '';
+  for (const word of name
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)) {
+    const next = slug ? `${slug}_${word}` : word;
+    if (next.length > 24) break;
+    slug = next;
+  }
+  return slug;
+}
+
+/** A Veefore action's tool name, led by its app, so an agent with several apps tells them apart. */
+export function appToolName(app: string, key: string): string {
+  const slug = appSlug(app);
+  return !slug || key === slug || key.startsWith(`${slug}_`) ? key : `${slug}_${key}`;
+}
+
+/**
+ * The app's Fields: each field of the app's actions once, required ones
+ * listed (✨ by default) and the rest under "Add field", left to the model
+ * until added. A field only some actions have says which. Ids are led by the
+ * app's id (`appFieldId`).
+ */
+export function appFieldsFor(
+  tools: VeeforeToolEntry[],
+  appId: string = tools[0] ? appOfEntry(tools[0]).id : 'app',
+): ResourceMapperField[] {
+  const merged = new Map<
+    string,
+    { field: ResourceMapperField; usedBy: string[]; required: boolean }
+  >();
+  for (const tool of tools) {
+    const action = appOfEntry(tool).action;
+    const fields = fieldsFromSchema((tool.parameter_schema ?? {}) as JsonSchema, {
+      fromAi: true,
+      override: true,
+      choicesAsText: true,
+    });
+    for (const field of fields) {
+      const seen = merged.get(field.id);
+      if (seen) {
+        seen.usedBy.push(action);
+        seen.required = seen.required || field.required;
+        continue;
+      }
+      merged.set(field.id, { field: { ...field }, usedBy: [action], required: field.required });
+    }
+  }
+  const several = tools.length > 1;
+  return [...merged.values()]
+    .map(({ field, usedBy, required }) => ({
+      ...field,
+      id: appFieldId(appId, field.id),
+      // A field only one of several actions has says which, briefly.
+      displayName:
+        several && usedBy.length === 1 ? `${field.displayName} (${usedBy[0]})` : field.displayName,
+      required,
+      removed: !required,
+    }))
+    .sort((a, b) => Number(b.required) - Number(a.required));
+}
+
+/**
+ * Version 3's actions as configs: the picked actions of the app, each with
+ * the app's Fields (a value set there fixes that field for every action that
+ * has it; anything else is the model's), the purpose and the ✨ hint. Fields
+ * and picks left from another app (the node's app was changed) are ignored.
+ */
+export function appConfigs(
+  input: {
+    app: unknown;
+    actions: unknown;
+    fields: RawAction['parameters'];
+    purpose: unknown;
+  },
+  available: VeeforeToolEntry[],
+  evaluate: (name: string) => unknown,
+): { raw: RawAction[]; configs: ActionConfig[]; tools: VeeforeToolEntry[]; hints: string[] } {
+  const app = appOfValue(input.app);
+  const tools = appTools(available, input.app);
+  const choice = actionsChoice(input.actions, () => evaluate('actions'));
+  const { tools: picked, foreign } = chosenTools(tools, choice);
+  const hints =
+    foreign && tools.length > 0
+      ? [
+          `The actions picked in this node are not ${app?.name ?? 'this app'}'s (was the app changed?), so the model may use all of its actions. Pick them again to limit it.`,
+        ]
+      : [];
+  const instructions = choice.all ? choice.hint.trim() : '';
+  const fields = scopedFields(input.fields, app?.id ?? '');
+  const raw: RawAction[] = picked.map((tool) => ({
+    tool: selectionValue(tool),
+    parameters: tool.kind === 'CLIENT' ? null : fields,
+    purpose: input.purpose,
+    descriptionType: 'auto',
+  }));
+  // A field's value is read under its Fields id.
+  const fieldPath = (name: string) =>
+    name.replace(
+      /^parameters\.value\.(.+)$/s,
+      (_match, field: string) => `parameters.value.${appFieldId(app?.id ?? '', field)}`,
+    );
+  const configs = picked.map((tool, index) => {
+    const config = readAction(
+      raw[index]!,
+      tool.parameter_schema as JsonSchema | undefined,
+      (name) => evaluate(fieldPath(name)),
+      { unlistedToModel: true },
+    );
+    if (tool.kind !== 'CLIENT') config.name = appToolName(appOfEntry(tool).name, tool.key);
+    if (instructions) config.instructions = instructions;
+    return config;
+  });
+  return { raw, configs, tools: picked, hints };
+}

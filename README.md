@@ -47,24 +47,31 @@ Saving the credential tests it against the gateway.
 ## Veefore Tools (for an AI Agent)
 
 Connect **Veefore Tools** to an AI Agent's Tool input and pick one of the
-agent's actions: it is offered to the model as a tool, and Veefore decides
-every call. Add one node per action, as with n8n's own tool nodes. Each has a
-**Tool Description** (Set Automatically from Veefore, or Set Manually), a
-**Purpose** (shown to approvers; write it, or let the model decide it with ✨)
-and, under Options, a **Tool Name**.
+agent's **apps** (WhatsApp, Gmail, Stripe, …): its actions are offered to the
+model as tools, the model picks the one each request needs, and Veefore decides
+every call. Add one node per app, as with n8n's own tool nodes. Who performs
+the app, its credential and its account values are set once in Veefore.
 
-- **Veefore performs it**: the gateway carries it out. **Fields** lists the
-  action's fields from Veefore, typed, required ones first and optional extras
-  under "Add field to send". Each is **Defined automatically by the model**
-  (✨, with an editable hint) until you set a value, which is then fixed and
-  never shown to the model. Account setup such as a WhatsApp phone number ID is set once on the
-  tool in Veefore (**Fixed values**): applied to every call, never offered to
-  the model.
-- **n8n performs it**: adding one shows an **n8n Tools** input. Connect the n8n
-  tool that performs it (Gmail, Slack, HTTP Request, …) there instead of to the
-  agent, and set its fields in that tool. The model sees it by its own name,
-  and it runs only after Veefore allows that exact call. Tools wired in for
-  anything else are not offered.
+- **Actions**: empty means all of the app's actions. Pick some to offer only
+  those, or let the model decide (✨) with a hint on how to choose.
+- **Fields** (an app Veefore performs): the fields its actions require, each
+  **Defined automatically by the model** (✨, with an editable hint) until you
+  set a value, which is then fixed for every action that has the field and
+  never shown to the model. Every other field is filled by the model; add it
+  under "Add field to send" to set it or steer the model. Account setup such
+  as a WhatsApp phone number ID is set once in Veefore (**Fixed values**):
+  applied to every call, never offered to the model.
+- **Purpose**: shown to approvers. By default the model says why with each
+  call (✨); or write it.
+- **n8n performs the app**: the node shows an **n8n Tools** input. Connect
+  n8n's own tools for its actions (Gmail, Slack, HTTP Request, …) there
+  instead of to the agent, and set their fields in those tools. An app Veefore
+  performs shows the input for its actions only n8n can perform. Each runs only
+  after Veefore allows that exact call. Tools wired in for anything else are
+  not offered.
+
+The model sees each action by a name led by its app
+(`whatsapp_business_cloud_send_message`).
 
 Allowed: it runs once. Refused: nothing runs, and the model is told why. Needs
 approval: the node waits up to **Wait for a Decision** (2 minutes by default).
@@ -82,9 +89,9 @@ request runs, Veefore checks the n8n tool is still in the workflow.
 Guard** were removed (first shipped in 2.3.0). Replace either with Veefore
 Tools and add the same action.
 
-**New in 3.3.0:** a new Veefore Tools node (version 2) holds one action with
-n8n's own field list. Nodes added earlier keep several actions per node and
-keep working; add a new node per action to get the field list.
+**New in 3.4.0:** a new Veefore Tools node (version 3) holds one app, and the
+model picks among its actions. Nodes added earlier keep working: several
+actions per node (before 3.3.0) or one action per node (3.3.x).
 
 ## Important
 
