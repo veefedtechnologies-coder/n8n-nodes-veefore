@@ -91,6 +91,16 @@ export interface ActionConfig {
 /** The argument a model fills with its purpose, when Purpose is left to it. */
 export const PURPOSE_ARGUMENT = 'veefore_purpose';
 
+/**
+ * Several items in one call (delete every draft): one entry per item, each
+ * with the action's fields. One call, one approval card for all of them.
+ */
+export const BATCH_ARGUMENT = 'veefore_batch';
+/** In a batch entry: what the item is, for the person approving ("Refund initiated"). */
+export const LABEL_ARGUMENT = 'veefore_label';
+/** The most items one call takes. */
+export const MAX_BATCH_ITEMS = 100;
+
 /** A raw action item from the node: `{ tool, toolName, toolDescription, purpose, parameters }`. */
 export interface RawAction {
   tool?: unknown;
@@ -328,7 +338,14 @@ interface EntryBase {
 }
 
 export type PlanEntry =
-  | (EntryBase & { kind: 'veefore'; schema: JsonObjectSchema })
+  | (EntryBase & {
+      kind: 'veefore';
+      schema: JsonObjectSchema;
+      /** What a call of one must fill in (left out of a batch-capable schema). */
+      required?: string[];
+      /** It takes BATCH_ARGUMENT: several items in one call. */
+      batch?: boolean;
+    })
   | (EntryBase & {
       kind: 'n8n';
       /** The connected tool's own schema (n8n's), passed through untouched. */
@@ -417,6 +434,10 @@ export function planTools(
      * says so when called (versions 1 and 2). Version 3 offers only what can run.
      */
     offerMissing?: boolean;
+    /** Actions Veefore performs take BATCH_ARGUMENT: several items, one call, one approval. */
+    batch?: boolean;
+    /** Actions that need an ID tell the model to look it up, not to ask the user (`withFindIds`). */
+    findIds?: boolean;
   } = {},
 ): Plan {
   const offerMissing = options.offerMissing !== false;
@@ -447,11 +468,21 @@ export function planTools(
       config.description ||
       String((tool as { description?: unknown }).description || tool.name || tool.key);
     if (tool.kind !== 'CLIENT') {
+      const schema = withPurposeArgument(modelSchema(tool.parameter_schema, config.model), config);
+      const name = unique(safeName(config.name || tool.key));
+      // A list or search is one call; anything done to items may be done to many.
+      const batched = options.batch === true && hasFields(schema) && !listsThings(tool, name);
       entries.push({
         kind: 'veefore',
-        name: unique(safeName(config.name || tool.key)),
-        description: told(description, config),
-        schema: withPurposeArgument(modelSchema(tool.parameter_schema, config.model), config),
+        name,
+        description: told(
+          batched
+            ? `${description.replace(/\.?\s*$/, '.')} For several items, call it once with all of them in ${BATCH_ARGUMENT}.`
+            : description,
+          config,
+        ),
+        schema: batched ? withBatchArgument(schema) : schema,
+        ...(batched ? { required: schema.required ?? [], batch: true } : {}),
         tool,
         config,
       });
@@ -498,6 +529,7 @@ export function planTools(
       `The connected tool "${nodeOf(candidate, nodes)?.name ?? candidate.name}" is not offered to the model: add its Veefore action (set to "n8n performs it") under Actions.`,
     );
   }
+  if (options.findIds === true) hints.push(...withFindIds(entries, available));
   return { entries, hints };
 }
 
@@ -537,7 +569,343 @@ export function parametersFor(
 ): Record<string, unknown> {
   const rest = { ...args };
   delete rest[PURPOSE_ARGUMENT];
+  delete rest[BATCH_ARGUMENT];
+  delete rest[LABEL_ARGUMENT];
   return { ...rest, ...entry.config.fixed };
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/** One item of a batch call: what Veefore runs, and what the approver is told it is. */
+export interface BatchItem {
+  parameters: Record<string, unknown>;
+  label: string | null;
+}
+
+/**
+ * The items of a batch call, or null for a call of one. Entries are the
+ * action's fields (a model may send them as JSON text); fields filled in
+ * beside the batch, when they are not one of its entries, are one more item.
+ * More than MAX_BATCH_ITEMS is refused, never cut short silently.
+ */
+export function batchItemsFor(entry: PlanEntry, args: Record<string, unknown>): BatchItem[] | null {
+  if (entry.kind !== 'veefore' || !entry.batch) return null;
+  let raw = args[BATCH_ARGUMENT];
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw) as unknown;
+    } catch {
+      raw = null;
+    }
+  }
+  // One entry sent on its own, not in a list.
+  if (isRecord(raw)) raw = [raw];
+  if (!Array.isArray(raw)) return null;
+  const entries = raw.filter(isRecord);
+  if (entries.length === 0) return null;
+  // Only the action's own fields: anything else a model adds is dropped, as for a call of one.
+  const fields = new Set(Object.keys(entry.schema.properties));
+  fields.delete(BATCH_ARGUMENT);
+  fields.delete(PURPOSE_ARGUMENT);
+  const ownOf = (entryArgs: Record<string, unknown>) => {
+    const own: Record<string, unknown> = {};
+    for (const [name, value] of Object.entries(entryArgs)) {
+      if (fields.has(name) && value !== undefined && value !== null && value !== '')
+        own[name] = value;
+    }
+    return own;
+  };
+  // Fields filled in beside the batch are shared by every item (the same
+  // message to several people); an item's own value wins. One that every
+  // item replaces and none repeats is an item of its own or a placeholder:
+  // which, only the model knows, so it is asked rather than guessed.
+  const shared = ownOf(args);
+  const owns = entries.map(ownOf);
+  const lost = Object.keys(shared).filter(
+    (name) =>
+      owns.every((own) => name in own) &&
+      !owns.some((own) => canonical(own[name]) === canonical(shared[name])),
+  );
+  if (lost.length > 0) {
+    throw new Error(
+      `Nothing was done: ${lost.join(', ')} is filled in beside ${BATCH_ARGUMENT} and differently in every entry of it. Put every item in ${BATCH_ARGUMENT}, and beside it only what all of them share.`,
+    );
+  }
+  const items: BatchItem[] = [];
+  const seen = new Set<string>();
+  entries.forEach((entryArgs, index) => {
+    const parameters = parametersFor(entry, { ...shared, ...owns[index] });
+    // The same item twice is done once.
+    const key = canonical(parameters);
+    if (seen.has(key)) return;
+    seen.add(key);
+    const label = entryArgs[LABEL_ARGUMENT];
+    items.push({
+      parameters,
+      label: typeof label === 'string' && label.trim() ? label.trim().slice(0, 120) : null,
+    });
+  });
+  if (items.length > MAX_BATCH_ITEMS) {
+    throw new Error(
+      `At most ${MAX_BATCH_ITEMS} items in one call; this one has ${items.length}. Nothing was done. Send the first ${MAX_BATCH_ITEMS} now and the rest in another call.`,
+    );
+  }
+  return items;
+}
+
+/** The same value, whatever order its keys come in. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/** The fields a call of one still lacks (the schema leaves them optional for batches). */
+export function missingFields(entry: PlanEntry, parameters: Record<string, unknown>): string[] {
+  if (entry.kind !== 'veefore') return [];
+  return (entry.required ?? []).filter((name) => {
+    const value = parameters[name];
+    return value === undefined || value === null || value === '';
+  });
+}
+
+/**
+ * What a batch still lacks, in words for the model, or null when every item
+ * has its required fields. A batch with a gap is not started at all, so it
+ * is never left half done.
+ */
+export function missingInBatch(entry: PlanEntry, items: BatchItem[]): string | null {
+  const gaps = items.flatMap((item, index) => {
+    const missing = missingFields(entry, item.parameters);
+    return missing.length > 0
+      ? [`item ${index + 1}${item.label ? ` (${item.label})` : ''} has no ${missing.join(', ')}`]
+      : [];
+  });
+  if (gaps.length === 0) return null;
+  const shown = gaps.slice(0, 5).join('; ');
+  const more = gaps.length > 5 ? `; and ${gaps.length - 5} more` : '';
+  return `Nothing was done: ${shown}${more}. Fill these in for every item in ${BATCH_ARGUMENT} and call again.`;
+}
+
+/** A field's shape, without its words: what a batch entry repeats. */
+function compactProperty(property: unknown): unknown {
+  if (!isRecord(property)) return property;
+  const out: Record<string, unknown> = {};
+  for (const key of ['type', 'enum', 'format']) if (key in property) out[key] = property[key];
+  if (isRecord(property.items)) out.items = compactProperty(property.items);
+  if (isRecord(property.properties)) {
+    out.properties = Object.fromEntries(
+      Object.entries(property.properties).map(([name, value]) => [name, compactProperty(value)]),
+    );
+    if (Array.isArray(property.required)) out.required = property.required;
+  }
+  return Object.keys(out).length > 0 ? out : { type: 'string' };
+}
+
+/** Whether the model fills in any field (more than the purpose). */
+function hasFields(schema: JsonObjectSchema): boolean {
+  return Object.keys(schema.properties).some((name) => name !== PURPOSE_ARGUMENT);
+}
+
+/**
+ * Adds BATCH_ARGUMENT: the same action for several items in one call. The
+ * fields stay as they are, but are optional at the top (a batch call leaves
+ * them empty); a call of one is checked for them (`missingFields`) before it
+ * is sent.
+ */
+function withBatchArgument(schema: JsonObjectSchema): JsonObjectSchema {
+  const fields = Object.entries(schema.properties).filter(([name]) => name !== PURPOSE_ARGUMENT);
+  if (fields.length === 0) return schema;
+  const required = schema.required ?? [];
+  const properties: Record<string, unknown> = {};
+  for (const [name, property] of Object.entries(schema.properties)) {
+    if (!required.includes(name) || !isRecord(property)) {
+      properties[name] = property;
+      continue;
+    }
+    const said = typeof property.description === 'string' ? property.description.trim() : '';
+    properties[name] = {
+      ...property,
+      description: `${said ? `${said.replace(/\.?$/, '.')} ` : ''}Required, unless you use ${BATCH_ARGUMENT}.`,
+    };
+  }
+  properties[BATCH_ARGUMENT] = {
+    type: 'array',
+    description: `For several items at once (all of them, every draft, each person): one entry per item, with the fields above, and leave the fields above empty. One call and one approval for all of them; never call this tool once per item.`,
+    items: {
+      type: 'object',
+      properties: {
+        ...Object.fromEntries(fields.map(([name, property]) => [name, compactProperty(property)])),
+        [LABEL_ARGUMENT]: {
+          type: 'string',
+          description: 'What this item is, for the person approving (the draft’s subject, a name)',
+        },
+      },
+      ...(required.length > 0 ? { required } : {}),
+    },
+  };
+  return { ...schema, properties, required: undefined };
+}
+
+const ID_NAME = /(^ids?$|Ids?$|_ids?$|IDs?$)/;
+
+/** An ID field, with what it names in words (`Draft ID` → draft). */
+interface IdField {
+  name: string;
+  /** What it identifies, for matching it to a list ("draft"). */
+  words: Set<string>;
+}
+
+/**
+ * The fields of an action that name one thing by its ID (`messageId`,
+ * `draft_id`, `Draft_ID`): the required ones Veefore lists, or every ID-like
+ * one of an n8n tool's own schema.
+ */
+function idFields(entry: PlanEntry): IdField[] {
+  if (entry.kind === 'missing') return [];
+  const properties: Record<string, unknown> =
+    entry.kind === 'veefore'
+      ? entry.schema.properties
+      : Object.fromEntries((schemaKeys(entry.schema) ?? []).map((name) => [name, {}]));
+  const names =
+    entry.kind === 'veefore'
+      ? (entry.required ?? entry.schema.required ?? [])
+      : Object.keys(properties);
+  return names.flatMap((name) => {
+    const property = properties[name];
+    const title = isRecord(property) && typeof property.title === 'string' ? property.title : '';
+    if (!ID_NAME.test(name) && !/\bIDs?\b/.test(title)) return [];
+    // n8n names a draft's ID `messageId`; its label says "Draft ID".
+    const words = subjectWords(/\bIDs?\b/.test(title) ? title : name);
+    return [{ name, words: words.size > 0 ? words : subjectWords(name) }];
+  });
+}
+
+/** Words that say what is done, not to what: left out when matching an ID to a list. */
+const ACTION_WORDS = new Set([
+  'add',
+  'all',
+  'and',
+  'create',
+  'delete',
+  'find',
+  'for',
+  'from',
+  'get',
+  'ids',
+  'info',
+  'into',
+  'list',
+  'many',
+  'mark',
+  'one',
+  'read',
+  'remove',
+  'reply',
+  'search',
+  'send',
+  'the',
+  'trash',
+  'unread',
+  'untrash',
+  'update',
+  'with',
+]);
+
+/** What a name is about, as singular words: `Get many drafts` → draft; `threadId` → thread. */
+function subjectWords(text: string): Set<string> {
+  return new Set(
+    text
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((word) => word.length > 2 && !ACTION_WORDS.has(word))
+      .map((word) => (word.endsWith('ies') ? `${word.slice(0, -3)}y` : word.replace(/s$/, ''))),
+  );
+}
+
+/** A tool that lists or searches (n8n's "Get many …", "Search …"). */
+function listsThings(tool: VeeforeToolEntry, name: string): boolean {
+  const action = tool.app?.action || tool.name || '';
+  return (
+    /^(get many|get all|list|search|find)\b/i.test(action) ||
+    /(get_many|get_all|_list|list_|search|find)/i.test(name)
+  );
+}
+
+/** What a list tool lists, in words. */
+function listedWords(tool: VeeforeToolEntry): Set<string> {
+  return subjectWords(tool.app?.action || tool.name || tool.key);
+}
+
+/** The list tools that find what these IDs name, best first. */
+function findersFor<T>(ids: IdField[], finders: T[], words: (finder: T) => Set<string>): T[] {
+  const scored = finders
+    .map((finder) => {
+      const listed = words(finder);
+      const score = ids.reduce(
+        (sum, id) => sum + [...id.words].filter((word) => listed.has(word)).length,
+        0,
+      );
+      return { finder, score };
+    })
+    .filter(({ score }) => score > 0);
+  return scored.sort((a, b) => b.score - a.score).map(({ finder }) => finder);
+}
+
+/**
+ * Tells the model to find an ID itself, with the app's own list or search
+ * tools, instead of asking the user for one they would not know. Returns
+ * hints for the person building the workflow: an action whose IDs nothing
+ * offered here can look up, when one of the agent's actions could.
+ */
+function withFindIds(entries: PlanEntry[], available: VeeforeToolEntry[] = []): string[] {
+  const hints: string[] = [];
+  const finders = entries.filter(
+    (entry) => entry.kind !== 'missing' && listsThings(entry.tool, entry.name),
+  );
+  for (const entry of entries) {
+    if (entry.kind === 'missing' || listsThings(entry.tool, entry.name)) continue;
+    const ids = idFields(entry);
+    if (ids.length === 0) continue;
+    const named = ids.map((id) => id.name).join(' or ');
+    const found = findersFor(ids, finders, (finder) => listedWords(finder.tool)).slice(0, 2);
+    const how =
+      found.length > 0
+        ? `look it up first with ${found.map((finder) => finder.name).join(' or ')} (by its subject, name or other details), then use the ID it returns`
+        : `look it up first with one of your tools that lists or searches them (by its subject, name or other details). If you have none, say you cannot look it up, and ask for the ID only as a last resort`;
+    entry.description = `${entry.description}\n\nDo not ask the user for ${named}: ${how}.`.slice(
+      0,
+      2000,
+    );
+    if (found.length > 0) continue;
+    // One of the agent's actions in Veefore could find it, but is not offered here.
+    const app = appOfEntry(entry.tool).id;
+    const could = findersFor(
+      ids,
+      available.filter(
+        (tool) =>
+          appOfEntry(tool).id === app &&
+          listsThings(tool, tool.key) &&
+          !entries.some((offered) => offered.tool.key === tool.key),
+      ),
+      listedWords,
+    );
+    if (could[0]) {
+      const label = appOfEntry(entry.tool).action || entry.tool.name || entry.tool.key;
+      const finder = appOfEntry(could[0]).action || could[0].name || could[0].key;
+      hints.push(
+        `"${label}" needs ${named}, which people do not know. Also give the model "${finder}", so it can look it up by name.`,
+      );
+    }
+  }
+  return hints;
 }
 
 /** The purpose for a call: set in the node, else what the model said, if it was asked. */

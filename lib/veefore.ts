@@ -74,6 +74,17 @@ export interface ActionInput {
   approvalId?: string;
   authorizationId?: string;
   runtime: RuntimeContext;
+  /** Decided with the other requests of this batch (one approval card). */
+  batch?: ActionBatch;
+}
+
+/** The longest purpose the gateway takes. */
+export const MAX_PURPOSE = 200;
+
+/** Text cut to `max` characters, marked when cut. */
+export function clip(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max - 1).trimEnd()}…`;
 }
 
 export class VeeforeGatewayError extends Error {
@@ -272,6 +283,38 @@ export function itemIdempotencyKey(scope: IdempotencyScope, override?: string): 
   return `n8n:${createHash('sha256').update(material).digest('hex')}`;
 }
 
+/** Requests decided together: one batch, its size, and which one this is. */
+export interface ActionBatch {
+  id: string;
+  size: number;
+  index: number;
+  /** What this item is, for the person approving (a draft's subject). */
+  label?: string;
+}
+
+/**
+ * The batch of one action in one run: every request of the same action from
+ * the same step of the same execution is shown to the approver as one card
+ * and decided at once ("delete every draft"). Without an execution id, the
+ * call is a batch of its own.
+ */
+export function runBatchId(scope: {
+  instanceId: string | null;
+  workflowId: string | null;
+  executionId: string | null;
+  node: string;
+  tool: string;
+}): string {
+  const material = canonicalJson({
+    instance: scope.instanceId,
+    workflow: scope.workflowId,
+    execution: scope.executionId ?? `none:${randomBytes(16).toString('hex')}`,
+    node: scope.node,
+    tool: scope.tool,
+  });
+  return `n8n_${createHash('sha256').update(material).digest('hex').slice(0, 32)}`;
+}
+
 interface CachedToken {
   token: string;
   expiresAt: number;
@@ -377,7 +420,8 @@ export class VeeforeGateway {
       tool: input.tool,
       action: input.action || undefined,
       parameters: input.parameters,
-      purpose: input.purpose || undefined,
+      // A longer purpose is refused by the gateway: the start says enough.
+      purpose: input.purpose?.trim() ? clip(input.purpose, MAX_PURPOSE) : undefined,
       idempotency_key: input.idempotencyKey,
       approval_id: input.approvalId,
       authorization_id: input.authorizationId,
@@ -391,6 +435,16 @@ export class VeeforeGateway {
           execution_id: input.runtime.executionId,
           step: input.runtime.step,
         },
+        ...(input.batch
+          ? {
+              batch: {
+                id: input.batch.id,
+                size: input.batch.size,
+                index: input.batch.index,
+                ...(input.batch.label ? { label: clip(input.batch.label, 120) } : {}),
+              },
+            }
+          : {}),
       },
     };
   }

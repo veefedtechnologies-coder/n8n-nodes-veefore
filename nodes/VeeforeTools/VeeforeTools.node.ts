@@ -15,6 +15,8 @@ import {
 import {
   EDITOR_TOOLS_MAX_AGE_MS,
   itemIdempotencyKey,
+  runBatchId,
+  type ActionInput,
   type VeeforeGateway,
 } from '../../lib/veefore';
 import type { GuardedNode, VeeforeToolEntry } from '../../lib/guard';
@@ -31,10 +33,14 @@ import {
   appValue,
   groupApps,
   N8N_PERFORMS,
+  BATCH_ARGUMENT,
   TOOLS_MESSAGES,
   argumentsFor,
+  batchItemsFor,
   fieldValue,
   keyOf,
+  missingFields,
+  missingInBatch,
   needsN8nTools,
   parametersFor,
   planTools,
@@ -43,6 +49,7 @@ import {
   VEEFORE_PERFORMS,
   selectionValue,
   type ActionConfig,
+  type BatchItem,
   type ConnectedTool,
   type Plan,
   type PlanEntry,
@@ -55,6 +62,7 @@ import {
   followApproval,
   originOf,
   reportClientResult,
+  runVeeforeBatch,
   runVeeforeCall,
 } from '../Veefore/calls';
 import { gatewayFor } from '../Veefore/gateway';
@@ -206,6 +214,9 @@ async function prepare(context: Context, itemIndex: number): Promise<Prepared> {
     : [];
   const plan = planTools(configs, available, wired, nodes, {
     offerMissing: node.typeVersion < 3,
+    // Every version: several items in one call, and IDs looked up, not asked for.
+    batch: true,
+    findIds: true,
   });
   plan.hints.unshift(...hints);
   return { plan, gateway };
@@ -239,26 +250,60 @@ async function callTool(
   if (entry.kind === 'missing') {
     return { status: 'refused', message: TOOLS_MESSAGES.notConnected(label) };
   }
+  // Every call of one action in one run is one approval card: the items of a
+  // batch call, and calls made one by one while the first is still waiting.
+  const batchId = runBatchId({
+    instanceId: origin.instanceScope,
+    workflowId: origin.runtime.workflowId,
+    executionId: origin.runtime.executionId,
+    node: node.name,
+    tool: entry.tool.key,
+  });
   if (entry.kind === 'veefore') {
-    const parameters = parametersFor(entry, args);
-    const idempotencyKey = itemIdempotencyKey({
-      instanceId: origin.instanceScope,
-      workflowId: origin.runtime.workflowId,
-      executionId: origin.runtime.executionId,
-      node: callKey,
-      itemIndex,
-      tool: entry.tool.key,
-      parameters,
-    });
-    return runVeeforeCall(
-      prepared.gateway,
-      {
+    let items: BatchItem[] | null;
+    try {
+      items = batchItemsFor(entry, args);
+    } catch (error) {
+      return { status: 'refused', message: (error as Error).message };
+    }
+    const purpose = purposeFor(entry, args);
+    const keyFor = (parameters: Record<string, unknown>) =>
+      itemIdempotencyKey({
+        instanceId: origin.instanceScope,
+        workflowId: origin.runtime.workflowId,
+        executionId: origin.runtime.executionId,
+        node: callKey,
+        itemIndex,
         tool: entry.tool.key,
         parameters,
-        purpose: purposeFor(entry, args),
-        idempotencyKey,
-        runtime: origin.runtime,
-      },
+      });
+    const inputFor = (item: BatchItem, index: number, size: number): ActionInput => ({
+      tool: entry.tool.key,
+      parameters: item.parameters,
+      purpose,
+      idempotencyKey: keyFor(item.parameters),
+      runtime: origin.runtime,
+      batch: { id: batchId, size, index, ...(item.label ? { label: item.label } : {}) },
+    });
+    if (!items || items.length === 1) {
+      const item = items?.[0] ?? { parameters: parametersFor(entry, args), label: null };
+      const missing = missingFields(entry, item.parameters);
+      if (missing.length > 0) {
+        return {
+          status: 'refused',
+          message: `Nothing was done: ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} missing. Fill ${missing.length === 1 ? 'it' : 'them'} in${entry.batch ? `, or list several items in ${BATCH_ARGUMENT}` : ''}, and call again.`,
+        };
+      }
+      return runVeeforeCall(prepared.gateway, inputFor(item, 0, 1), waitMs);
+    }
+    const gap = missingInBatch(entry, items);
+    if (gap) return { status: 'refused', message: gap };
+    return runVeeforeBatch(
+      prepared.gateway,
+      items.map((item, index) => ({
+        input: inputFor(item, index, items.length),
+        label: item.label,
+      })),
       waitMs,
     );
   }
@@ -272,6 +317,7 @@ async function callTool(
     callKey,
     itemIndex,
     purpose: entry.config.purpose,
+    batch: { id: batchId, size: 1, index: 0 },
   });
   if (!answer.approved) {
     let message = answer.chatInput ?? 'Veefore did not allow this. It was NOT done.';

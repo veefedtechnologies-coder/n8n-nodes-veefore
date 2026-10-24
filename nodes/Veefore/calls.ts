@@ -4,6 +4,7 @@ import {
   itemIdempotencyKey,
   outcomeOf,
   waitForApproval,
+  type ActionBatch,
   type ActionInput,
   type Outcome,
   type RuntimeContext,
@@ -141,6 +142,16 @@ export function handedOverMessage(expiresAt: string | undefined): string {
   return `Not done yet: a person must approve this in Veefore first. Veefore will carry it out automatically if they approve it ${untilText(expiresAt)}; nothing more is needed from you or the user. If they deny it or no one decides in time, it will not happen. Tell the user exactly this, and do not call this tool again for the same request.`;
 }
 
+/** Said of a request that joined others of the same action already waiting for approval. */
+export const JOINED_PREFIX =
+  'Added to the requests like it that are already waiting: one approval covers all of them. ';
+
+/** Whether an approval joined requests of its batch already waiting (the gateway counts them). */
+export function joinedWaiting(approval: { batch_waiting?: unknown } | null | undefined): boolean {
+  const waiting = Number(approval?.batch_waiting ?? 1);
+  return Number.isFinite(waiting) && waiting > 1;
+}
+
 /** The action cannot be done later by Veefore (n8n performs it, or the hand-over failed). */
 export function notHandedOverMessage(expiresAt: string | undefined, why: string): string {
   return `Not done yet: a person must approve this in Veefore first, and it will not happen on its own (${why.replace(/\.$/, '')}). Tell the user it is waiting for approval, and that once it is approved ${untilText(expiresAt)} they should ask again; then call this tool again with the same request.`;
@@ -159,11 +170,20 @@ export async function runVeeforeCall(
   let outcome = outcomeOf(decision);
   let approvalStatus: string | undefined;
   const approval = decision.approval as
-    | { approval_id?: string; expires_at?: string }
+    | { approval_id?: string; expires_at?: string; batch_waiting?: unknown }
     | null
     | undefined;
   if (outcome === 'approval' && approval?.approval_id) {
-    approvalStatus = await waitForApproval(gateway, approval.approval_id, sleep, Date.now, waitMs);
+    // It joined this run's requests of the action already waiting: they are
+    // one approval, decided later, so this one does not wait again.
+    const joined = joinedWaiting(approval);
+    approvalStatus = await waitForApproval(
+      gateway,
+      approval.approval_id,
+      sleep,
+      Date.now,
+      joined ? 0 : waitMs,
+    );
     if (approvalStatus === 'PENDING') {
       // Still undecided: Veefore carries it out if it is approved later.
       const handover = await gateway
@@ -173,7 +193,7 @@ export async function runVeeforeCall(
       return {
         ...summarize('approval', decision, 'PENDING'),
         message: handover.ok
-          ? handedOverMessage(approval.expires_at)
+          ? `${joined ? JOINED_PREFIX : ''}${handedOverMessage(approval.expires_at)}`
           : notHandedOverMessage(approval.expires_at, handover.error.message),
         handed_over: handover.ok,
         expires_at: approval.expires_at ?? null,
@@ -191,6 +211,242 @@ export async function runVeeforeCall(
     }
   }
   return summarize(outcome, decision, approvalStatus);
+}
+
+/** One item of a batch call: the request for it, and what it is. */
+export interface BatchCall {
+  input: ActionInput;
+  label: string | null;
+}
+
+/** How many of a batch's requests are sent at once. */
+export const BATCH_CONCURRENCY = 5;
+
+/** `run` for every item, at most `limit` at a time, results in order. */
+async function eachLimited<T, R>(
+  items: T[],
+  limit: number,
+  run: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (let index = next++; index < items.length; index = next++) {
+      results[index] = await run(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** Where one item of a batch ended up. */
+export type BatchItemStatus = 'done' | 'waiting' | 'refused' | 'failed' | 'error';
+
+export interface BatchItemState {
+  decision: Record<string, unknown> | null;
+  outcome: Outcome;
+  approvalStatus?: string;
+  /** Veefore could not be asked. */
+  error?: string;
+  /** Waiting: Veefore carries it out once approved (or could not take it over: why). */
+  handedOver?: boolean;
+  handoverError?: string;
+  expiresAt?: string;
+}
+
+function statusOf(state: BatchItemState): BatchItemStatus {
+  if (state.error !== undefined) return 'error';
+  if (state.outcome === 'allowed') return 'done';
+  if (state.outcome === 'approval') return 'waiting';
+  return state.decision?.outcome === 'FAILED' ? 'failed' : 'refused';
+}
+
+const count = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** What the model should say about a batch, all of it at once. */
+export function batchMessage(states: BatchItemState[]): string {
+  const total = states.length;
+  const by = (status: BatchItemStatus) => states.filter((state) => statusOf(state) === status);
+  const done = by('done').length;
+  const waiting = by('waiting');
+  const refused = by('refused');
+  const failed = by('failed').length;
+  const errors = by('error').length;
+  const parts: string[] = [];
+  if (done === total)
+    return `Done: all ${total} were carried out. Veefore allowed them. Tell the user.`;
+  if (done > 0) parts.push(`Done: ${done} of ${total} carried out.`);
+  if (waiting.length > 0) {
+    const expiries = waiting
+      .map((state) => state.expiresAt)
+      .filter((at): at is string => typeof at === 'string')
+      .sort();
+    const until = untilText(expiries[0]);
+    const all = waiting.length === total ? `All ${total}` : count(waiting.length, 'item');
+    if (waiting.every((state) => state.handedOver)) {
+      parts.push(
+        `Not done yet: ${all} wait for a person to approve them in Veefore, in one approval for all of them. Veefore carries them out automatically if they are approved ${until}; nothing more is needed from you or the user. If they are denied, or no one decides in time, they will not happen.`,
+      );
+    } else {
+      const why = waiting.find((state) => !state.handedOver)?.handoverError ?? 'no answer';
+      parts.push(
+        `Not done yet: ${all} wait for a person to approve them in Veefore, and will not happen on their own (${why.replace(/\.$/, '')}). Once they are approved ${until}, the user should ask again; then call this tool again with the same items.`,
+      );
+    }
+  }
+  if (refused.length > 0) {
+    const reasons = [
+      ...new Set(
+        refused.map((state) =>
+          state.approvalStatus === 'DENIED'
+            ? 'a person denied it'
+            : state.approvalStatus === 'EXPIRED'
+              ? 'no one approved it in time'
+              : String(state.decision?.reason ?? '')
+                  .trim()
+                  .replace(/\.+$/, ''),
+        ),
+      ),
+    ].filter(Boolean);
+    parts.push(
+      `Not done: ${count(refused.length, 'item')} refused${reasons.length === 1 ? ` (${reasons[0]})` : ''}; each item says why.`,
+    );
+  }
+  if (failed > 0) {
+    parts.push(
+      `Failed: ${count(failed, 'item')} did not complete; each item says why. Do not assume ${failed === 1 ? 'it' : 'they'} happened.`,
+    );
+  }
+  if (errors > 0) {
+    parts.push(
+      `Not done: Veefore could not be asked about ${count(errors, 'item')}; the user can try ${errors === 1 ? 'it' : 'them'} again in a moment.`,
+    );
+  }
+  parts.push(
+    waiting.length > 0
+      ? 'Tell the user exactly this, and do not call this tool again for the items waiting for approval.'
+      : 'Tell the user exactly this.',
+  );
+  return parts.join(' ');
+}
+
+/**
+ * An AI agent's call for several items of one action Veefore performs
+ * (delete every draft): every request is sent, and those that need a person
+ * wait in one approval card, decided at once. It waits once, up to `waitMs`,
+ * then each approved item is carried out and the rest are handed to Veefore,
+ * which carries them out if they are approved later.
+ */
+export async function runVeeforeBatch(
+  gateway: VeeforeGateway,
+  calls: BatchCall[],
+  waitMs: number,
+  options: { sleep?: (ms: number) => Promise<void>; now?: () => number } = {},
+): Promise<IDataObject> {
+  const wait = options.sleep ?? sleep;
+  const now = options.now ?? Date.now;
+  const states = await eachLimited(
+    calls,
+    BATCH_CONCURRENCY,
+    async ({ input }): Promise<BatchItemState> => {
+      try {
+        const decision = await gateway.execute(input);
+        return { decision, outcome: outcomeOf(decision) };
+      } catch (error) {
+        return {
+          decision: null,
+          outcome: 'refused',
+          error: (error as Error).message ?? 'no answer',
+        };
+      }
+    },
+  );
+  const held = states.flatMap((state, index) => {
+    const approval = state.decision?.approval as
+      | { approval_id?: string; expires_at?: string }
+      | null
+      | undefined;
+    return state.outcome === 'approval' && approval?.approval_id
+      ? [{ state, index, approvalId: approval.approval_id, expiresAt: approval.expires_at }]
+      : [];
+  });
+  if (held.length > 0) {
+    // One decision covers the batch: wait on its first request, then read the rest.
+    const first = await waitForApproval(gateway, held[0]!.approvalId, wait, now, waitMs).catch(
+      () => 'PENDING',
+    );
+    await eachLimited(
+      held,
+      BATCH_CONCURRENCY,
+      async ({ state, index, approvalId, expiresAt }, k) => {
+        const input = calls[index]!.input;
+        const status =
+          k === 0
+            ? first
+            : await waitForApproval(gateway, approvalId, wait, now, 0).catch(() => 'PENDING');
+        state.approvalStatus = status;
+        state.expiresAt = expiresAt;
+        if (status === 'APPROVED') {
+          try {
+            state.decision = await gateway.execute({
+              ...input,
+              approvalId,
+              idempotencyKey: approvalReplayKey(input.idempotencyKey, approvalId),
+            });
+            state.outcome = outcomeOf(state.decision);
+          } catch (error) {
+            state.outcome = 'refused';
+            state.error = (error as Error).message ?? 'no answer';
+          }
+        } else if (status === 'PENDING') {
+          // Still undecided: Veefore carries it out if it is approved later.
+          try {
+            await gateway.handOver(approvalId, input);
+            state.handedOver = true;
+          } catch (error) {
+            state.handedOver = false;
+            state.handoverError = (error as Error).message ?? 'the hand-over failed';
+          }
+        } else {
+          state.outcome = 'refused';
+        }
+      },
+    );
+  }
+  const items = states.map((state, index) => {
+    const status = statusOf(state);
+    const decision = state.decision ?? {};
+    const approval = (decision.approval ?? null) as IDataObject | null;
+    return {
+      item: index + 1,
+      label: calls[index]!.label,
+      status,
+      message:
+        status === 'error'
+          ? `Veefore could not be asked (${state.error}), so it was NOT done.`
+          : status === 'waiting'
+            ? state.handedOver
+              ? 'Waiting for a person to approve it in Veefore, which then carries it out.'
+              : 'Waiting for a person to approve it in Veefore; it will not happen on its own.'
+            : messageFor(state.outcome, decision, state.approvalStatus),
+      approval_id: (approval?.approval_id as string | undefined) ?? null,
+      action_id: (decision.action_id ?? null) as string | null,
+      result: (decision.result && typeof decision.result === 'object'
+        ? decision.result
+        : null) as IDataObject | null,
+    };
+  });
+  const tally = (status: BatchItemStatus) => items.filter((item) => item.status === status).length;
+  return {
+    status: 'batch',
+    message: batchMessage(states),
+    total: items.length,
+    done: tally('done'),
+    waiting: tally('waiting'),
+    refused: tally('refused'),
+    failed: tally('failed') + tally('error'),
+    items,
+  } as IDataObject;
 }
 
 /** A call still waiting for a person when the agent answered. */
@@ -350,6 +606,8 @@ export async function decideN8nCall(
     itemIndex: number;
     /** Why the agent takes this action, shown to approvers. */
     purpose?: string;
+    /** Decided with the run's other calls of this action (one approval card). */
+    batch?: ActionBatch;
   },
 ): Promise<GuardAnswer> {
   const { target, origin } = input;
@@ -396,20 +654,22 @@ export async function decideN8nCall(
       idempotencyKey,
       runtime,
       ...(purpose ? { purpose } : {}),
+      ...(input.batch ? { batch: input.batch } : {}),
     };
     let decision = await gateway.execute(base);
     let outcome = outcomeOf(decision);
     const approval = decision.approval as
-      | { approval_id?: string; expires_at?: string; status?: string }
+      | { approval_id?: string; expires_at?: string; status?: string; batch_waiting?: unknown }
       | null
       | undefined;
     if (outcome === 'approval' && approval?.approval_id) {
+      // Joined others of this run already waiting: decided with them, later.
       const status = await waitForApproval(
         gateway,
         approval.approval_id,
         sleep,
         Date.now,
-        input.waitMs,
+        joinedWaiting(approval) ? 0 : input.waitMs,
       );
       if (status === 'PENDING') {
         return {

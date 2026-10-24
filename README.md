@@ -93,6 +93,17 @@ Tools and add the same action.
 model picks among its actions. Nodes added earlier keep working: several
 actions per node (before 3.3.0) or one action per node (3.3.x).
 
+**New in 3.5.0:** several items in one request ("delete every draft") are one
+call and one approval. An action Veefore performs takes `veefore_batch`, one
+entry per item with what it is (a draft's subject); approvers see one card,
+get one notice and decide all of them at once, and each item stays bound to
+its own values and is used once. The node waits once, then carries out what
+was approved and hands the rest to Veefore. Calls of the same action in one
+run join the card while it waits. An action that needs an ID tells the model
+to look it up with the app's list or search actions instead of asking the
+user for it, and Gmail's lists now return each draft's or message's subject
+when Veefore performs them. Applies to every node version.
+
 ## Important
 
 Installing this node does not protect a workflow that also contains a direct
