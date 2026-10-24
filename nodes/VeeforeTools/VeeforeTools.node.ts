@@ -8,6 +8,7 @@ import {
   type INodeType,
   type INodeTypeDescription,
   type ISupplyDataFunctions,
+  type ResourceMapperFields,
   type SupplyData,
 } from 'n8n-workflow';
 import {
@@ -18,6 +19,7 @@ import {
 import type { GuardedNode, VeeforeToolEntry } from '../../lib/guard';
 import {
   INPUTS_EXPRESSION,
+  SUBTITLE_EXPRESSION,
   N8N_PERFORMS,
   TOOLS_MESSAGES,
   argumentsFor,
@@ -28,6 +30,7 @@ import {
   planTools,
   purposeFor,
   readAction,
+  VEEFORE_PERFORMS,
   selectionValue,
   type ActionConfig,
   type ConnectedTool,
@@ -45,7 +48,7 @@ import {
   runVeeforeCall,
 } from '../Veefore/calls';
 import { gatewayFor } from '../Veefore/gateway';
-import { labelFor, type JsonSchema } from '../Veefore/schema';
+import { fieldsFromSchema, labelFor, type JsonSchema } from '../Veefore/schema';
 
 /**
  * Veefore Tools: the agent's Veefore actions for an AI Agent, as many as you
@@ -110,17 +113,34 @@ function actionsOf(
   itemIndex: number,
   available: VeeforeToolEntry[],
 ): { raw: RawAction[]; configs: ActionConfig[] } {
-  const raw = (context.getNodeParameter(ACTIONS, itemIndex, [], {
-    rawExpressions: true,
-  }) ?? []) as RawAction[];
-  const configs = raw.map((item, index) => {
-    const schema = available.find((tool) => tool.key === keyOf(item.tool))?.parameter_schema as
+  const read = (name: string, fallback: unknown) =>
+    context.getNodeParameter(name, itemIndex, fallback, { rawExpressions: true });
+  const schemaOf = (item: RawAction) =>
+    available.find((tool) => tool.key === keyOf(item.tool))?.parameter_schema as
       | JsonSchema
       | undefined;
-    return readAction(item, schema, (name) =>
-      context.getNodeParameter(`${ACTIONS}[${index}].${name}`, itemIndex),
+  if (context.getNode().typeVersion >= 2) {
+    // One action per node, set at the top level.
+    const options = (read('options', {}) ?? {}) as IDataObject;
+    const item: RawAction = {
+      tool: read('tool', ''),
+      parameters: read('parameters', null) as RawAction['parameters'],
+      purpose: read('purpose', ''),
+      descriptionType: read('descriptionType', 'auto'),
+      toolDescription: read('toolDescription', ''),
+      actionOptions: { toolName: options.toolName },
+    };
+    const config = readAction(item, schemaOf(item), (name) =>
+      context.getNodeParameter(name, itemIndex),
     );
-  });
+    return { raw: [item], configs: [config] };
+  }
+  const raw = (read(ACTIONS, []) ?? []) as RawAction[];
+  const configs = raw.map((item, index) =>
+    readAction(item, schemaOf(item), (name) =>
+      context.getNodeParameter(`${ACTIONS}[${index}].${name}`, itemIndex),
+    ),
+  );
   return { raw, configs };
 }
 
@@ -287,9 +307,9 @@ export class VeeforeTools implements INodeType {
     name: 'veeforeTools',
     icon: { light: 'file:veefore.svg', dark: 'file:veefore.dark.svg' },
     group: ['transform'],
-    version: 1,
-    subtitle:
-      '={{ (($parameter.actions && $parameter.actions.action) || []).length + " action(s)" }}',
+    version: [1, 2],
+    defaultVersion: 2,
+    subtitle: SUBTITLE_EXPRESSION,
     description:
       "Give an AI Agent this agent's Veefore actions. n8n tools connected here run only when Veefore allows the call.",
     defaults: { name: 'Veefore' },
@@ -311,11 +331,13 @@ export class VeeforeTools implements INodeType {
         name: 'notice',
         type: 'notice',
         default: '',
+        displayOptions: { show: { '@version': [1] } },
       },
       {
         displayName: 'Actions',
         name: 'actions',
         type: 'fixedCollection',
+        displayOptions: { show: { '@version': [1] } },
         placeholder: 'Add Action',
         typeOptions: { multipleValues: true, sortable: true },
         default: {},
@@ -411,6 +433,113 @@ export class VeeforeTools implements INodeType {
           },
         ],
       },
+      // Version 2: one action per node, as n8n's own tool nodes. n8n's field
+      // mapper works only at a node's top level, so each action is a node.
+      {
+        displayName:
+          'One of this agent’s actions as a tool for the AI Agent. Veefore decides every call. Add another Veefore Tools node for each further action. Values set once in Veefore (Fixed values, such as a WhatsApp phone number ID) are applied there and never shown to the model.',
+        name: 'noticeV2',
+        type: 'notice',
+        default: '',
+        displayOptions: { show: { '@version': [{ _cnd: { gte: 2 } }] } },
+      },
+      {
+        displayName: 'Action Name or ID',
+        name: 'tool',
+        type: 'options',
+        typeOptions: { loadOptionsMethod: 'getAgentTools' },
+        default: '',
+        required: true,
+        description:
+          'One of this agent\'s actions in Veefore, with who performs it. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+        displayOptions: { show: { '@version': [{ _cnd: { gte: 2 } }] } },
+      },
+      {
+        displayName:
+          "n8n performs this action. Connect the n8n tool that performs it (Gmail, Slack, …) to this node's n8n Tools input, not to the agent, and set its fields in that tool. It runs only when Veefore allows the call.",
+        name: 'n8nNotice',
+        type: 'notice',
+        default: '',
+        displayOptions: {
+          show: {
+            ...{ '@version': [{ _cnd: { gte: 2 } }] },
+            tool: [{ _cnd: { endsWith: N8N_PERFORMS } }],
+          },
+        },
+      },
+      {
+        displayName: 'Tool Description',
+        name: 'descriptionType',
+        type: 'options',
+        noDataExpression: true,
+        options: [
+          {
+            name: 'Set Automatically',
+            value: 'auto',
+            description: 'Use the description from Veefore',
+          },
+          {
+            name: 'Set Manually',
+            value: 'manual',
+            description: 'Write what the tool does and when the model should use it',
+          },
+        ],
+        default: 'auto',
+        displayOptions: { show: { '@version': [{ _cnd: { gte: 2 } }] } },
+      },
+      {
+        displayName: 'Description',
+        name: 'toolDescription',
+        type: 'string',
+        noDataExpression: true,
+        typeOptions: { rows: 2 },
+        default: '',
+        required: true,
+        placeholder: 'e.g. Refund an order once the customer has confirmed it',
+        description: 'Tells the model what this tool does and when to use it',
+        displayOptions: {
+          show: { ...{ '@version': [{ _cnd: { gte: 2 } }] }, descriptionType: ['manual'] },
+        },
+      },
+      {
+        displayName: 'Fields',
+        name: 'parameters',
+        type: 'resourceMapper',
+        noDataExpression: true,
+        default: { mappingMode: 'defineBelow', value: null },
+        required: true,
+        typeOptions: {
+          loadOptionsDependsOn: ['tool'],
+          resourceMapper: {
+            resourceMapperMethod: 'getToolFields',
+            mode: 'add',
+            valuesLabel: 'Fields',
+            fieldWords: { singular: 'field', plural: 'fields' },
+            addAllFields: true,
+            multiKeyMatch: false,
+            supportAutoMap: false,
+            noFieldsError: 'This action has no fields to fill in.',
+          },
+        },
+        description:
+          'Each field is defined automatically by the model unless you give it a value. A value set here is fixed and never shown to the model.',
+        displayOptions: {
+          show: {
+            ...{ '@version': [{ _cnd: { gte: 2 } }] },
+            tool: [{ _cnd: { endsWith: VEEFORE_PERFORMS } }],
+          },
+        },
+      },
+      {
+        displayName: 'Purpose',
+        name: 'purpose',
+        type: 'string',
+        default: '',
+        placeholder: 'e.g. Confirm the customer’s order',
+        description:
+          'Why the agent takes this action. Shown to approvers and recorded. Let the model decide it (✨) to have it say why with each call.',
+        displayOptions: { show: { '@version': [{ _cnd: { gte: 2 } }] } },
+      },
       {
         displayName: 'Options',
         name: 'options',
@@ -428,6 +557,17 @@ export class VeeforeTools implements INodeType {
               'Whether an action n8n performs runs by itself once a person approves it after the agent stopped waiting. n8n must keep running until then; otherwise the user asks again once it is approved.',
           },
           {
+            displayName: 'Tool Name',
+            name: 'toolName',
+            type: 'string',
+            noDataExpression: true,
+            default: '',
+            placeholder: 'e.g. refund_order',
+            description:
+              "The name the model calls this tool by: letters, digits, _ and -. By default the name from Veefore (or the n8n tool's own).",
+            displayOptions: { show: { '@version': [{ _cnd: { gte: 2 } }] } },
+          },
+          {
             displayName: 'Wait for a Decision (Minutes)',
             name: 'waitMinutes',
             noDataExpression: true,
@@ -443,6 +583,30 @@ export class VeeforeTools implements INodeType {
   };
 
   methods = {
+    resourceMapping: {
+      /** The action's fields, from Veefore: typed, required first, each ✨ by default. */
+      async getToolFields(this: ILoadOptionsFunctions): Promise<ResourceMapperFields> {
+        const key = keyOf(this.getCurrentNodeParameter('tool'));
+        if (!key) return { fields: [], emptyFieldsNotice: 'Choose the action first.' };
+        const tool = (await editorTools(this)).find((entry) => entry.key === key);
+        if (!tool) {
+          return {
+            fields: [],
+            emptyFieldsNotice:
+              'This agent may not use that action. Check its access in Veefore, then refresh.',
+          };
+        }
+        return {
+          fields: fieldsFromSchema((tool.parameter_schema ?? {}) as JsonSchema, {
+            fromAi: true,
+            override: true,
+            extrasRemoved: true,
+          }),
+          emptyFieldsNotice:
+            'Nothing to fill in: every field of this action is set in Veefore (Fixed values).',
+        };
+      },
+    },
     loadOptions: {
       async getActionFields(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
         const tools = (await editorTools(this)).filter((tool) => tool.kind !== 'CLIENT');

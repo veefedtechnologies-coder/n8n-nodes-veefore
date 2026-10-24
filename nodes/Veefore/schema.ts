@@ -14,10 +14,20 @@ export interface JsonSchema {
   description?: string;
   title?: string;
   enum?: unknown[];
+  default?: unknown;
+  format?: string;
   properties?: Record<string, JsonSchema>;
   required?: string[];
   items?: JsonSchema;
+  /** Where n8n keeps the field: `additionalFields` / `options` are optional extras. */
+  'x-veefore-n8n-group'?: string;
 }
+
+/**
+ * n8n's marker for "Defined automatically by the model". The editor shows a
+ * value starting with `={{ <marker> $fromAI(` as the ✨ chip, not as text.
+ */
+export const FROM_AI_MARKER = '/*n8n-auto-generated-fromAI-override*/';
 
 /**
  * A list of plain values (emails, ids, tags). Shown as one text field where
@@ -56,6 +66,7 @@ function typeOf(schema: JsonSchema): string {
 function fieldType(schema: JsonSchema): FieldType {
   if (Array.isArray(schema.enum) && schema.enum.length > 0) return 'options';
   if (isScalarList(schema)) return 'string';
+  if (typeOf(schema) === 'string' && schema.format === 'date-time') return 'dateTime';
   switch (typeOf(schema)) {
     case 'integer':
     case 'number':
@@ -87,12 +98,33 @@ function fromAiType(schema: JsonSchema): 'string' | 'number' | 'boolean' | 'json
   }
 }
 
-/** A `$fromAI` expression with every argument as a safe string literal. */
-export function fromAiExpression(key: string, description: string, type: string): string {
+/**
+ * A `$fromAI` expression with every argument as a safe string literal. With
+ * `override`, it carries n8n's marker, so the editor shows it as
+ * "Defined automatically by the model" (✨) instead of an expression.
+ */
+export function fromAiExpression(
+  key: string,
+  description: string,
+  type: string,
+  override = false,
+): string {
   const quote = (value: string) => `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
   const oneLine = description.replace(/\s+/g, ' ').trim().slice(0, 300);
-  return `={{ $fromAI(${quote(key)}, ${quote(oneLine)}, ${quote(type)}) }}`;
+  return `={{ ${override ? `${FROM_AI_MARKER} ` : ''}$fromAI(${quote(key)}, ${quote(oneLine)}, ${quote(type)}) }}`;
 }
+
+/** A catalog description without Veefore's note of where n8n keeps the field. */
+export function cleanDescription(text: string | undefined): string {
+  return (text ?? '').replace(/\s*\(n8n: [^)]*\)\s*$/, '').trim();
+}
+
+/** Optional extras (n8n's "Additional Fields" / "Options"): offered under "Add field". */
+export function isExtra(property: JsonSchema): boolean {
+  return typeof property['x-veefore-n8n-group'] === 'string';
+}
+
+const sentence = (text: string) => (/[.!?)]$/.test(text) ? text : `${text}.`);
 
 /** `due_date` / `dueDate` → `Due date`. */
 export function labelFor(id: string): string {
@@ -106,18 +138,27 @@ export function labelFor(id: string): string {
 
 export function fieldsFromSchema(
   schema: JsonSchema,
-  options: { fromAi: boolean },
+  options: {
+    fromAi: boolean;
+    /** The `$fromAI` default is n8n's ✨ override, not a plain expression. */
+    override?: boolean;
+    /** Optional extras start hidden, under "Add field", as in n8n's own nodes. */
+    extrasRemoved?: boolean;
+  },
 ): ResourceMapperField[] {
   const required = new Set(schema.required ?? []);
-  // Required fields first, so what must be filled in is at the top.
+  // Required fields first, then the main ones, then the extras.
+  const rank = (id: string, property: JsonSchema) =>
+    required.has(id) ? 0 : isExtra(property) ? 2 : 1;
   const entries = Object.entries(schema.properties ?? {}).sort(
-    ([a], [b]) => Number(required.has(b)) - Number(required.has(a)),
+    ([a, pa], [b, pb]) => rank(a, pa) - rank(b, pb),
   );
   return entries.map(([id, property]) => {
     const type = fieldType(property);
     const list = isScalarList(property);
     const label = `${property.title || labelFor(id)}${list ? ' (separate with commas)' : ''}`;
-    const description = `${property.description || labelFor(id)}${list ? '. Several values separated by commas' : ''}`;
+    const base = cleanDescription(property.description) || property.title || labelFor(id);
+    const description = `${base}${list ? '. Several values separated by commas' : ''}`;
     const field: ResourceMapperField = {
       id,
       displayName: label,
@@ -133,10 +174,22 @@ export function fieldsFromSchema(
         value: value as string | number | boolean,
       }));
     }
+    if (options.extrasRemoved && !field.required && isExtra(property)) field.removed = true;
     if (options.fromAi && AI_KEY.test(id)) {
       const allowed =
         type === 'options' ? ` One of: ${(property.enum ?? []).map(String).join(', ')}.` : '';
-      field.defaultValue = fromAiExpression(id, `${description}.${allowed}`, fromAiType(property));
+      field.defaultValue = fromAiExpression(
+        id,
+        `${sentence(description)}${allowed}`,
+        fromAiType(property),
+        options.override === true,
+      );
+    } else if (
+      typeof property.default === 'string' ||
+      typeof property.default === 'number' ||
+      typeof property.default === 'boolean'
+    ) {
+      field.defaultValue = property.default;
     }
     return field;
   });

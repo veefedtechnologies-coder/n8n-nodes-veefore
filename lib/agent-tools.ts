@@ -34,7 +34,10 @@ export function keyOf(value: unknown): string {
 }
 
 /** The expression n8n evaluates in the editor to show the n8n Tools input. */
-export const INPUTS_EXPRESSION = `={{ ((list) => (Array.isArray(list) && list.some((a) => String((a && a.tool) || '').endsWith('${N8N_PERFORMS}'))) ? [{ type: 'ai_tool', displayName: 'n8n Tools' }] : [])($parameter.actions && $parameter.actions.action) }}`;
+export const INPUTS_EXPRESSION = `={{ ((list) => (Array.isArray(list) && list.some((a) => String((a && a.tool) || '').endsWith('${N8N_PERFORMS}'))) ? [{ type: 'ai_tool', displayName: 'n8n Tools' }] : [])($parameter.actions ? $parameter.actions.action : [{ tool: $parameter.tool }]) }}`;
+
+/** Version 1: how many actions; version 2: which one. */
+export const SUBTITLE_EXPRESSION = `={{ $parameter.actions ? (($parameter.actions.action || []).length + " action(s)") : String($parameter.tool || "").replace(/::(?:n8n|veefore)$/, "").replace(/_/g, " ") }}`;
 
 export function needsN8nTools(items: unknown): boolean {
   return (
@@ -71,12 +74,16 @@ export const PURPOSE_ARGUMENT = 'veefore_purpose';
 /** A raw action item from the node: `{ tool, toolName, toolDescription, purpose, parameters }`. */
 export interface RawAction {
   tool?: unknown;
-  toolName?: unknown;
+  /** `auto` (Veefore's description) or `manual` (`toolDescription`). Absent before 3.3.0. */
+  descriptionType?: unknown;
   toolDescription?: unknown;
   purpose?: unknown;
-  /** Fields set in the node: `name` is `<tool key>::<field>` (or the field alone). */
+  actionOptions?: { toolName?: unknown } | null;
+  /** Saved by 3.0.0–3.2.0 next to the other settings. Read when plain text. */
+  toolName?: unknown;
+  /** Saved by 3.2.0: a list of picked fields, `name` is `<tool key>::<field>`. Still read. */
   fields?: { field?: Array<{ name?: unknown; value?: unknown }> | null } | null;
-  /** Saved by 3.0.0: a parameter mapper per action. Still read. */
+  /** The action's fields (n8n's field mapper): each one ✨ (the model) or a value set here. */
   parameters?: {
     value?: Record<string, unknown> | null;
     schema?: Array<{ id: string; type?: string; removed?: boolean }>;
@@ -124,10 +131,16 @@ export function readAction(
     typeof value === 'string' && !value.trim().startsWith('=') ? value.trim() : '';
   const key = keyOf(raw.tool);
   const mapper = raw.parameters;
+  const toolName = text(raw.actionOptions?.toolName) || text(raw.toolName);
+  // Before 3.3.0 there was no choice: a description written in was used.
+  const manual =
+    raw.descriptionType === 'manual' ||
+    (raw.descriptionType === undefined && text(raw.toolDescription) !== '');
+  const description = manual ? text(raw.toolDescription) : '';
   const config: ActionConfig = {
     key,
-    ...(text(raw.toolName) ? { name: text(raw.toolName) } : {}),
-    ...(text(raw.toolDescription) ? { description: text(raw.toolDescription) } : {}),
+    ...(toolName ? { name: toolName } : {}),
+    ...(description ? { description } : {}),
     ...(text(raw.purpose) ? { purpose: text(raw.purpose) } : {}),
     fixed: {},
     model: null,
@@ -139,8 +152,11 @@ export function readAction(
     if (fromAi) config.purposeFromModel = unescape(fromAi[4] ?? '');
   }
 
-  // Fields: each one the model fills (with the hint it is given) or a value set here.
-  const entries = (Array.isArray(raw.fields?.field) ? raw.fields.field : []).filter(
+  // The field mapper wins: a 3.2.0 Fields list may linger, hidden, next to it.
+  const mapped =
+    mapper?.value && typeof mapper.value === 'object' && Object.keys(mapper.value).length > 0;
+  // 3.2.0's Fields list: each one the model fills (with its hint) or a value set here.
+  const entries = (!mapped && Array.isArray(raw.fields?.field) ? raw.fields.field : []).filter(
     (entry): entry is { name: string; value?: unknown } =>
       typeof entry?.name === 'string' && fieldKeyOf(entry.name, key) !== null,
   );

@@ -46,16 +46,18 @@ Saving the credential tests it against the gateway.
 
 ## Veefore Tools (for an AI Agent)
 
-Connect **Veefore Tools** to an AI Agent's Tool input and **Add Action** for
-each of the agent's actions, as many as you like. Each is offered to the model
-as a tool, and Veefore decides every call. Every action has its own **Tool
-Name**, **Tool Description** and **Purpose** (shown to approvers; write it,
-or let the model decide it with ✨).
+Connect **Veefore Tools** to an AI Agent's Tool input and pick one of the
+agent's actions: it is offered to the model as a tool, and Veefore decides
+every call. Add one node per action, as with n8n's own tool nodes. Each has a
+**Tool Description** (Set Automatically from Veefore, or Set Manually), a
+**Purpose** (shown to approvers; write it, or let the model decide it with ✨)
+and, under Options, a **Tool Name**.
 
-- **Veefore performs it**: the gateway carries it out. Under **Fields**, pick
-  a field and give it a value (fixed, hidden from the model) or let the model
-  decide it (✨, with your hint). Fields you don't add are filled by the
-  model. Account setup such as a WhatsApp phone number ID is set once on the
+- **Veefore performs it**: the gateway carries it out. **Fields** lists the
+  action's fields from Veefore, typed, required ones first and optional extras
+  under "Add field to send". Each is **Defined automatically by the model**
+  (✨, with an editable hint) until you set a value, which is then fixed and
+  never shown to the model. Account setup such as a WhatsApp phone number ID is set once on the
   tool in Veefore (**Fixed values**): applied to every call, never offered to
   the model.
 - **n8n performs it**: adding one shows an **n8n Tools** input. Connect the n8n
@@ -79,6 +81,10 @@ request runs, Veefore checks the n8n tool is still in the workflow.
 **Breaking in 3.0.0:** **Veefore Tool** (one action per node) and **Veefore
 Guard** were removed (first shipped in 2.3.0). Replace either with Veefore
 Tools and add the same action.
+
+**New in 3.3.0:** a new Veefore Tools node (version 2) holds one action with
+n8n's own field list. Nodes added earlier keep several actions per node and
+keep working; add a new node per action to get the field list.
 
 ## Important
 
