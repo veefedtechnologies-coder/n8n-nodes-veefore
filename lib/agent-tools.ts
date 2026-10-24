@@ -61,7 +61,12 @@ export interface ActionConfig {
    * parameter.
    */
   model: Record<string, string> | null;
+  /** Purpose left to the model: the hint it is given. It sends it with each call. */
+  purposeFromModel?: string;
 }
+
+/** The argument a model fills with its purpose, when Purpose is left to it. */
+export const PURPOSE_ARGUMENT = 'veefore_purpose';
 
 /** A raw action item from the node: `{ tool, toolName, toolDescription, purpose, parameters }`. */
 export interface RawAction {
@@ -69,10 +74,35 @@ export interface RawAction {
   toolName?: unknown;
   toolDescription?: unknown;
   purpose?: unknown;
+  /** Fields set in the node: `name` is `<tool key>::<field>` (or the field alone). */
+  fields?: { field?: Array<{ name?: unknown; value?: unknown }> | null } | null;
+  /** Saved by 3.0.0: a parameter mapper per action. Still read. */
   parameters?: {
     value?: Record<string, unknown> | null;
     schema?: Array<{ id: string; type?: string; removed?: boolean }>;
   } | null;
+}
+
+/** A field picked in the node, as stored: `send_message::to`. */
+export const FIELD_SEPARATOR = '::';
+export function fieldValue(toolKey: string, field: string): string {
+  return `${toolKey}${FIELD_SEPARATOR}${field}`;
+}
+
+/** The field a stored pick names, when it belongs to this action (or names no action). */
+export function fieldKeyOf(stored: string, toolKey: string): string | null {
+  const at = stored.lastIndexOf(FIELD_SEPARATOR);
+  if (at < 0) return stored.trim() || null;
+  return stored.slice(0, at) === toolKey ? stored.slice(at + FIELD_SEPARATOR.length) || null : null;
+}
+
+function typeOfProperty(property: JsonSchema | undefined): string {
+  const raw = Array.isArray(property?.type)
+    ? property?.type.find((t) => t !== 'null')
+    : property?.type;
+  if (raw === 'integer' || raw === 'number') return 'number';
+  if (raw === 'boolean' || raw === 'object' || raw === 'array') return raw;
+  return 'string';
 }
 
 const FROM_AI = /\$fromAI\(\s*(['"`])((?:\\.|(?!\1).)+)\1(?:\s*,\s*(['"`])((?:\\.|(?!\3).)*)\3)?/;
@@ -102,6 +132,53 @@ export function readAction(
     fixed: {},
     model: null,
   };
+  // Purpose left to the model ("Defined automatically by the model"): the
+  // model says why, per call, and approvers see it.
+  if (typeof raw.purpose === 'string' && raw.purpose.trim().startsWith('=')) {
+    const fromAi = FROM_AI.exec(raw.purpose);
+    if (fromAi) config.purposeFromModel = unescape(fromAi[4] ?? '');
+  }
+
+  // Fields: each one the model fills (with the hint it is given) or a value set here.
+  const entries = (Array.isArray(raw.fields?.field) ? raw.fields.field : []).filter(
+    (entry): entry is { name: string; value?: unknown } =>
+      typeof entry?.name === 'string' && fieldKeyOf(entry.name, key) !== null,
+  );
+  if (entries.length > 0) {
+    const properties = Object.keys(schema?.properties ?? {});
+    const model: Record<string, string> = Object.fromEntries(properties.map((name) => [name, '']));
+    const fixedRaw: Record<string, unknown> = {};
+    entries.forEach((entry, index) => {
+      const name = fieldKeyOf(entry.name, key)!;
+      const value = entry.value;
+      if (typeof value === 'string' && value.trim().startsWith('=')) {
+        const fromAi = FROM_AI.exec(value);
+        if (fromAi) {
+          model[name] = unescape(fromAi[4] ?? '');
+          return;
+        }
+        fixedRaw[name] = evaluate(`fields.field[${index}].value`);
+      } else if (value !== undefined && value !== null && value !== '') {
+        fixedRaw[name] = value;
+      } else {
+        return;
+      }
+      delete model[name];
+    });
+    config.fixed = parametersFromMapper(
+      {
+        value: fixedRaw as never,
+        schema: Object.keys(fixedRaw).map((id) => ({
+          id,
+          type: typeOfProperty(schema?.properties?.[id]),
+        })) as never,
+      },
+      schema,
+    );
+    config.model = properties.length > 0 ? model : null;
+    return config;
+  }
+
   if (!mapper || !mapper.value || typeof mapper.value !== 'object') return config;
 
   const removed = new Set((mapper.schema ?? []).filter((f) => f.removed).map((f) => f.id));
@@ -119,7 +196,7 @@ export function readAction(
         model[name] = unescape(fromAi[4] ?? '');
         continue;
       }
-      fixedRaw[name] = evaluate(name);
+      fixedRaw[name] = evaluate(`parameters.value.${name}`);
       continue;
     }
     fixedRaw[name] = value;
@@ -273,7 +350,7 @@ export function planTools(
         kind: 'veefore',
         name: unique(safeName(config.name || tool.key)),
         description,
-        schema: modelSchema(tool.parameter_schema, config.model),
+        schema: withPurposeArgument(modelSchema(tool.parameter_schema, config.model), config),
         tool,
         config,
       });
@@ -356,7 +433,33 @@ export function parametersFor(
   entry: PlanEntry,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
-  return { ...args, ...entry.config.fixed };
+  const rest = { ...args };
+  delete rest[PURPOSE_ARGUMENT];
+  return { ...rest, ...entry.config.fixed };
+}
+
+/** The purpose for a call: set in the node, else what the model said, if it was asked. */
+export function purposeFor(entry: PlanEntry, args: Record<string, unknown>): string | undefined {
+  if (entry.config.purpose) return entry.config.purpose;
+  const said = args[PURPOSE_ARGUMENT];
+  return typeof said === 'string' && said.trim() ? said.trim().slice(0, 500) : undefined;
+}
+
+/** Adds the purpose argument when Purpose is left to the model. Optional for the model. */
+function withPurposeArgument(schema: JsonObjectSchema, config: ActionConfig): JsonObjectSchema {
+  if (config.purpose || config.purposeFromModel === undefined) return schema;
+  return {
+    ...schema,
+    properties: {
+      ...schema.properties,
+      [PURPOSE_ARGUMENT]: {
+        type: 'string',
+        description:
+          config.purposeFromModel ||
+          'Why you are taking this action, in one sentence. Shown to the person who approves it.',
+      },
+    },
+  };
 }
 
 export const TOOLS_MESSAGES = {

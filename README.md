@@ -49,10 +49,13 @@ Saving the credential tests it against the gateway.
 Connect **Veefore Tools** to an AI Agent's Tool input and **Add Action** for
 each of the agent's actions, as many as you like. Each is offered to the model
 as a tool, and Veefore decides every call. Every action has its own **Tool
-Name**, **Tool Description** and **Purpose** (shown to approvers).
+Name**, **Tool Description** and **Purpose** (shown to approvers; write it,
+or let the model decide it with ✨).
 
-- **Veefore performs it**: the gateway carries it out. The model fills its
-  fields. Account setup such as a WhatsApp phone number ID is set once on the
+- **Veefore performs it**: the gateway carries it out. Under **Fields**, pick
+  a field and give it a value (fixed, hidden from the model) or let the model
+  decide it (✨, with your hint). Fields you don't add are filled by the
+  model. Account setup such as a WhatsApp phone number ID is set once on the
   tool in Veefore (**Fixed values**): applied to every call, never offered to
   the model.
 - **n8n performs it**: adding one shows an **n8n Tools** input. Connect the n8n
