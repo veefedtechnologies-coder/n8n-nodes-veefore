@@ -51,9 +51,10 @@ each of the agent's actions, as many as you like. Each is offered to the model
 as a tool, and Veefore decides every call. Every action has its own **Tool
 Name**, **Tool Description** and **Purpose** (shown to approvers).
 
-- **Veefore performs it**: the gateway carries it out. Its **Parameters** come
-  from Veefore, required ones first; each is filled by the model (with a hint
-  you can edit) or set to a fixed value the model never sees.
+- **Veefore performs it**: the gateway carries it out. The model fills its
+  fields. Account setup such as a WhatsApp phone number ID is set once on the
+  tool in Veefore (**Fixed values**): applied to every call, never offered to
+  the model.
 - **n8n performs it**: adding one shows an **n8n Tools** input. Connect the n8n
   tool that performs it (Gmail, Slack, HTTP Request, …) there instead of to the
   agent, and set its fields in that tool. The model sees it by its own name,

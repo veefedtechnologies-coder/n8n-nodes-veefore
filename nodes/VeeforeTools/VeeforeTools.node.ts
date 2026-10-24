@@ -8,7 +8,6 @@ import {
   type INodeType,
   type INodeTypeDescription,
   type ISupplyDataFunctions,
-  type ResourceMapperFields,
   type SupplyData,
 } from 'n8n-workflow';
 import {
@@ -21,7 +20,6 @@ import {
   INPUTS_EXPRESSION,
   N8N_PERFORMS,
   TOOLS_MESSAGES,
-  VEEFORE_PERFORMS,
   argumentsFor,
   keyOf,
   needsN8nTools,
@@ -45,7 +43,7 @@ import {
   runVeeforeCall,
 } from '../Veefore/calls';
 import { gatewayFor } from '../Veefore/gateway';
-import { fieldsFromSchema, type JsonSchema } from '../Veefore/schema';
+import type { JsonSchema } from '../Veefore/schema';
 
 /**
  * Veefore Tools: the agent's Veefore actions for an AI Agent, as many as you
@@ -307,7 +305,7 @@ export class VeeforeTools implements INodeType {
     properties: [
       {
         displayName:
-          "Add the actions this agent may take. Veefore decides every call. For an action that n8n performs, connect the matching n8n tool (Gmail, Slack, …) to this node's n8n Tools input instead of to the agent.",
+          "Add the actions this agent may take. Veefore decides every call. The model fills each action's fields; values set once in Veefore (Fixed values, such as a WhatsApp phone number ID) are applied there and never shown to the model. For an action that n8n performs, connect the matching n8n tool (Gmail, Slack, …) to this node's n8n Tools input instead of to the agent.",
         name: 'notice',
         type: 'notice',
         default: '',
@@ -332,7 +330,7 @@ export class VeeforeTools implements INodeType {
                 default: '',
                 required: true,
                 description:
-                  'One of this agent\'s actions in Veefore, with who performs it. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+                  'One of this agent\'s actions in Veefore, with who performs it. Account values such as a phone number ID are set on the action in Veefore (Fixed values). Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
               },
               {
                 displayName:
@@ -343,30 +341,9 @@ export class VeeforeTools implements INodeType {
                 displayOptions: { show: { tool: [{ _cnd: { endsWith: N8N_PERFORMS } }] } },
               },
               {
-                displayName: 'Parameters',
-                name: 'parameters',
-                type: 'resourceMapper',
-                noDataExpression: true,
-                default: { mappingMode: 'defineBelow', value: null },
-                typeOptions: {
-                  loadOptionsDependsOn: ['&tool'],
-                  resourceMapper: {
-                    resourceMapperMethod: 'getActionParameters',
-                    mode: 'add',
-                    fieldWords: { singular: 'parameter', plural: 'parameters' },
-                    addAllFields: true,
-                    multiKeyMatch: false,
-                    supportAutoMap: false,
-                    noFieldsError: 'This action has no parameters.',
-                  },
-                },
-                description:
-                  'Each parameter is filled by the model ($fromAI, with the hint it is given) or set here, so the model never sees it. Remove a parameter to leave it out.',
-                displayOptions: { show: { tool: [{ _cnd: { endsWith: VEEFORE_PERFORMS } }] } },
-              },
-              {
                 displayName: 'Purpose',
                 name: 'purpose',
+                noDataExpression: true,
                 type: 'string',
                 default: '',
                 description: 'Why the agent takes this action. Shown to approvers and recorded.',
@@ -374,6 +351,7 @@ export class VeeforeTools implements INodeType {
               {
                 displayName: 'Tool Description',
                 name: 'toolDescription',
+                noDataExpression: true,
                 type: 'string',
                 typeOptions: { rows: 2 },
                 default: '',
@@ -384,6 +362,7 @@ export class VeeforeTools implements INodeType {
               {
                 displayName: 'Tool Name',
                 name: 'toolName',
+                noDataExpression: true,
                 type: 'string',
                 default: '',
                 placeholder: 'e.g. refund_order',
@@ -404,6 +383,7 @@ export class VeeforeTools implements INodeType {
           {
             displayName: 'Do It When Approved Later',
             name: 'sendWhenApproved',
+            noDataExpression: true,
             type: 'boolean',
             default: true,
             description:
@@ -412,6 +392,7 @@ export class VeeforeTools implements INodeType {
           {
             displayName: 'Wait for a Decision (Minutes)',
             name: 'waitMinutes',
+            noDataExpression: true,
             type: 'number',
             typeOptions: { minValue: 0, maxValue: 1440 },
             default: 2,
@@ -432,22 +413,6 @@ export class VeeforeTools implements INodeType {
           value: selectionValue(tool),
           description: String((tool as { description?: unknown }).description || tool.key),
         }));
-      },
-    },
-    resourceMapping: {
-      async getActionParameters(this: ILoadOptionsFunctions): Promise<ResourceMapperFields> {
-        const key = keyOf(this.getCurrentNodeParameter('&tool'));
-        if (!key) return { fields: [], emptyFieldsNotice: 'Choose the action first.' };
-        const tool = (await editorTools(this)).find((entry) => entry.key === key);
-        if (!tool) {
-          return {
-            fields: [],
-            emptyFieldsNotice: 'This agent may not use that action. Check its access in Veefore.',
-          };
-        }
-        return {
-          fields: fieldsFromSchema((tool.parameter_schema ?? {}) as JsonSchema, { fromAi: true }),
-        };
       },
     },
   };

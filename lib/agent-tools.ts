@@ -87,7 +87,11 @@ export function readAction(
   schema: JsonSchema | undefined,
   evaluate: (name: string) => unknown,
 ): ActionConfig {
-  const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+  // Name, description and purpose are set by a person. An expression here is
+  // n8n's own "let the model fill it" override (saved by older versions of
+  // this node): ignored, so the model never names or justifies its own tool.
+  const text = (value: unknown) =>
+    typeof value === 'string' && !value.trim().startsWith('=') ? value.trim() : '';
   const key = keyOf(raw.tool);
   const mapper = raw.parameters;
   const config: ActionConfig = {
