@@ -519,6 +519,9 @@ export class VeeforeTools implements INodeType {
             multiKeyMatch: false,
             supportAutoMap: false,
             noFieldsError: 'This action has no fields to fill in.',
+            // A node saved with an older field list (a dropdown, say) is
+            // brought up to date when it is opened; values are kept.
+            refreshStaleSchemaOnOpen: true,
           },
         },
         description:
@@ -601,6 +604,7 @@ export class VeeforeTools implements INodeType {
             fromAi: true,
             override: true,
             extrasRemoved: true,
+            choicesAsText: true,
           }),
           emptyFieldsNotice:
             'Nothing to fill in: every field of this action is set in Veefore (Fixed values).',

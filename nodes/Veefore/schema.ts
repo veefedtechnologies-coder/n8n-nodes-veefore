@@ -144,6 +144,12 @@ export function fieldsFromSchema(
     override?: boolean;
     /** Optional extras start hidden, under "Add field", as in n8n's own nodes. */
     extrasRemoved?: boolean;
+    /**
+     * A list of allowed values as a text field, not a dropdown: n8n offers no
+     * ✨ ("let the model decide") on a dropdown. The values go in the label
+     * and in the model's hint.
+     */
+    choicesAsText?: boolean;
   },
 ): ResourceMapperField[] {
   const required = new Set(schema.required ?? []);
@@ -154,9 +160,14 @@ export function fieldsFromSchema(
     ([a, pa], [b, pb]) => rank(a, pa) - rank(b, pb),
   );
   return entries.map(([id, property]) => {
-    const type = fieldType(property);
+    const choices = fieldType(property) === 'options' ? (property.enum ?? []).map(String) : [];
+    const asText = options.choicesAsText === true && choices.length > 0;
+    const type: FieldType = asText ? 'string' : fieldType(property);
     const list = isScalarList(property);
-    const label = `${property.title || labelFor(id)}${list ? ' (separate with commas)' : ''}`;
+    const shown = choices.join(', ');
+    const label = `${property.title || labelFor(id)}${list ? ' (separate with commas)' : ''}${
+      asText ? ` (${shown.length <= 60 ? shown : `${shown.slice(0, 57)}…`})` : ''
+    }`;
     const base = cleanDescription(property.description) || property.title || labelFor(id);
     const description = `${base}${list ? '. Several values separated by commas' : ''}`;
     const field: ResourceMapperField = {
@@ -176,8 +187,7 @@ export function fieldsFromSchema(
     }
     if (options.extrasRemoved && !field.required && isExtra(property)) field.removed = true;
     if (options.fromAi && AI_KEY.test(id)) {
-      const allowed =
-        type === 'options' ? ` One of: ${(property.enum ?? []).map(String).join(', ')}.` : '';
+      const allowed = choices.length > 0 ? ` One of: ${choices.join(', ')}.` : '';
       field.defaultValue = fromAiExpression(
         id,
         `${sentence(description)}${allowed}`,
