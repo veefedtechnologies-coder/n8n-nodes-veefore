@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-veefore",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Veefore for n8n: run protected actions through Veefore's policy, approval and credential broker, from workflows and AI agents.",
   "license": "MIT",
   "homepage": "https://docs.veefore.com/build/n8n",
